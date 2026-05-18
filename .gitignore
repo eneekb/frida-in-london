@@ -1,0 +1,23 @@
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Fichiers de verrou Office (si index.html est ouvert dans Word par accident)
+~$*
+
+# Fichiers temporaires
+*.tmp
+*.bak
+*.swp
+
+# OS divers
+.DS_Store
+
+# Éditeurs
+.vscode/
+.idea/
+
+# Node (au cas où on ajouterait un dev server plus tard)
+node_modules/
