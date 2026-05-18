@@ -16,12 +16,39 @@ Quatre actes thématiques :
 
 ## État actuel du code
 
+### Hébergement et déploiement
+
+- **Repo public** : https://github.com/eneekb/frida-in-london
+- **URL live (GitHub Pages)** : https://eneekb.github.io/frida-in-london/ — redéployée automatiquement à chaque `git push` sur `main` (build ~1 min).
+- Authentification configurée via `gh auth login` + `gh auth setup-git`. `gh` est installé via winget mais **pas dans le PATH de Git Bash** — utiliser `"/c/Program Files/GitHub CLI/gh.exe"`.
+
 ### Fichiers du projet
 
-- **`frida_in_london.html`** — Le jeu complet, en monolithe. ~135 Ko, ~3900 lignes de JS dans une seule balise `<script>`. **Contient des duplications de plusieurs fonctions** (drawHUD, drawTeacup, drawScone, drawRibbon, drawShawl, drawCrown, drawPickup) à cause de troncatures répétées pendant le développement. En JS les déclarations s'écrasent (la dernière gagne) donc le code fonctionne, mais le fichier mérite un nettoyage.
-- **`solver.js`** — Solveur d'atteignabilité en Node. Réplique exactement la physique du jeu et fait un BFS sur les "plateformes" pour vérifier que chaque pièce, scone, bloc `?` et drapeau est accessible depuis le spawn. À garder synchronisé avec les constantes physiques du jeu.
-- **`build_levels.js`** — Générateur de niveaux avec validation automatique (utilise `solver.js`). Permet d'éditer la structure des niveaux en JS lisible puis d'exporter du JSON inséré dans le HTML.
+- **`index.html`** — Squelette HTML (75 lignes) qui ne contient plus que le canvas, le footer, et 13 balises `<script src="js/...">` dans l'ordre de chargement.
+- **`js/`** — Le jeu découpé en 13 modules (~3900 lignes JS au total) :
+  - **`core.js`** *(chargé en PREMIER)* — `canvas`, `ctx`, `W`, `H`, `TILE`, `game` state, `OBJECTIVES`, `LEVEL_THEME_OBJECT`. Doit être premier car `levels.js` calcule `LEVELS = RAW_LEVELS.map(parseLevel)` au top-level et `parseLevel` utilise `TILE`.
+  - `input.js` — clavier (`keys`, `keyPressed`, `consume`, `pressing`)
+  - `audio.js` — bips synthétisés Web Audio (`audioCtx`, `ensureAudio`, `blip`, `SFX`)
+  - `physics.js` — constantes physiques + `moveAndCollide`, `checkWallSide`, `tileAt`, `isSolid`, `isHazard`, `entBB`, `rectOverlap`, `checkHazards`
+  - `powers.js` — `POWER_POOL` (10 pouvoirs) + `rollPowerChoices` + durées (`POWER_DURATION`)
+  - `effects.js` — notifications (`pushNotif`, `drawNotifications` + icônes), particules (`spawnCoinBurst`, `spawnPuff`, `spawnPetals`, `drawParticles`), textes flottants
+  - `levels.js` — `RAW_LEVELS` (4 actes en texte) + `parseLevel` + `LEVELS` + `loadLevel` + `triggerDecor`
+  - `pickups.js` — `buildPickups`, `drawPickup`, `drawTeacup`, `drawScone`, `drawRibbon`, `drawShawl`, `drawCrown`, sprites lantern/gear/rose/brush
+  - `player.js` — `makePlayer`, `updatePlayer`, `killPlayer`, `drawFrida`, `drawFlower`
+  - `enemies.js` — `makeEnemy`, `updateEnemy`, `drawEnemy`, sprites Bobby/Sweep/Topboss/Smog/Dog/Sheep/Guard/Queen, `maybeChatter`, `drawChatter`
+  - `rendering.js` — `drawBackground`, `drawLondonBG`/`FactoryBG`/`MoorBG`/`BigBenBG`, `drawDecorOverlay`, `drawTiles`, `drawTile`, `drawGround`, `drawBrick`, `drawQBlock`, `drawSpike`, `drawFlag`, `drawLamp`, `drawBeam`, `drawGear`, `drawBarrel`, `drawBench`, `drawUnionJackFlag`, `drawCarriage`
+  - `ui.js` — `FRIDA_QUESTIONS`, `FRIDA_QUOTES`, `drawFridaQA`, `drawPowerSelect`, `drawHUD`, `drawPowerTimer`, `drawMiniTeacup`, `drawTinyFrida`, `drawTitle`, `drawIntermission`, `drawWinScreen`, `drawGameOver`, `drawPause`, helpers `wrapText`/`wrapTextLeft`/`wrapTextCenter`
+  - **`main.js`** *(chargé en DERNIER)* — `updateCamera`, `update`, `render`, `loop`, et l'appel `loop()` qui démarre tout. En dernier pour que les fonctions des autres modules existent au moment du boot.
+- **`solver.js`** — Solveur d'atteignabilité en Node. Réplique exactement la physique du jeu et fait un BFS sur les "plateformes" pour vérifier que chaque pièce, scone, bloc `?` et drapeau est accessible depuis le spawn. **À mettre à jour si la physique change dans `js/physics.js`**.
+- **`build_levels.js`** — Générateur de niveaux avec validation automatique (utilise `solver.js`). Permet d'éditer la structure des niveaux en JS lisible puis d'exporter du JSON.
 - **`frida_movement_lab.html`** — Mini-fichier de R&D pour la maniabilité, avec sliders en temps réel pour ajuster tous les paramètres physiques. C'est en l'utilisant qu'on a trouvé les valeurs actuelles. À garder pour les futures itérations.
+
+### Règles importantes après modularisation
+
+- **Pas de `<script type="module">`** — on utilise des `<script>` classiques pour que `file://` (double-clic sur `index.html`) marche aussi pour les tests rapides.
+- Toutes les variables top-level (`const`, `let`, `function`) sont **partagées entre les modules** via le scope global du script. Pas d'`import`/`export`.
+- **Ordre de chargement** : `core.js` en premier, `main.js` en dernier. Les 11 autres modules peuvent en théorie être dans n'importe quel ordre (ils ne contiennent que des définitions de fonctions et des littéraux), mais l'ordre actuel dans `index.html` respecte les dépendances logiques.
+- Quand tu ajoutes une fonction ou un module, **n'oublie pas de l'ajouter à `index.html`**.
 
 ### Mécaniques en place
 
@@ -95,50 +122,45 @@ Mouvements optionnels activés :
 
 Le jeu a été vérifié avec le solveur : **103/103 objets atteignables** sur les 4 niveaux avec ces valeurs.
 
-## Ce que je recommanderais de faire en priorité
+## Travaux déjà faits depuis la version Cowork
 
-### 1. Nettoyer les duplications de fonctions
+Ces étapes ont été menées lors du passage à Claude Code (2026-05-19) :
 
-Cherche dans `frida_in_london.html` les fonctions définies en double (au moins : `drawHUD`, `drawTeacup`, `drawScone`, `drawRibbon`, `drawShawl`, `drawCrown`, `drawPickup`, `drawMiniTeacup`, `drawTinyFrida`, peut-être `drawIntermission` et `drawTitle` aussi). Pour chacune, garde uniquement la **dernière** définition (c'est celle effectivement utilisée par JS). Le fichier devrait perdre 30-40% de sa taille.
+1. **Récupération depuis Cowork** → projet posé en local + dépôt Git initialisé.
+2. **Repo GitHub** + **GitHub Pages** activé → jeu jouable en ligne sur https://eneekb.github.io/frida-in-london/.
+3. **Nettoyage du code mort** : suppression de ~480 lignes après le premier `</script>` (5 blocs `</body></html>` empilés à cause de troncatures successives lors de la génération).
+4. **Suppression de fichiers obsolètes** : `build_levels_fixed.js` (doublon exact de `build_levels.js`) + `tail_chunks.py` + `tail_chunks2.py` (scripts d'assemblage par chunks plus utiles).
+5. **`README.md`** + **`.gitignore`** ajoutés.
+6. **Modularisation** : monolithe découpé en 13 modules dans `js/` (voir section "Fichiers du projet").
 
-### 2. Découper en modules
+## Pistes pour la suite (si demandées par Sébastien)
 
-Le fichier monolithique est devenu pénible à maintenir. Je proposerais cette structure :
+### Dev server avec hot reload
 
-```
-index.html           — squelette HTML + canvas + imports modules
-js/
-  main.js            — boucle de jeu, état global, init
-  physics.js         — constantes physiques, moveAndCollide, checkWall, corner correction
-  player.js          — makePlayer, updatePlayer, drawFrida
-  enemies.js         — makeEnemy, updateEnemy, drawBobby/Sweep/Topboss/Smog/Dog/Sheep/Guard/Queen, chatter
-  levels.js          — RAW_LEVELS, parseLevel, loadLevel, buildPickups
-  pickups.js         — drawTeacup, drawScone, drawRibbon, drawShawl, drawCrown, drawPickupLantern/Gear/Rose/Brush
-  powers.js          — POWER_POOL, rollPowerChoices, durations
-  ui.js              — drawHUD, drawTitle, drawIntermission, drawFridaQA, drawPowerSelect, drawWinScreen, drawGameOver, drawPause
-  rendering.js       — drawBackground, drawLondonBG/FactoryBG/MoorBG/BigBenBG, drawDecorOverlay, drawTiles, drawChatter, drawParticles, drawFloatTexts, drawNotifications, drawUnionJackFlag, drawCarriage
-  notifications.js   — pushNotif, updateNotifications, drawNotifications + icônes
-  audio.js           — SFX bips synthétisés
-  input.js           — keys, keyPressed, consume, pressing
-```
+Un simple `python -m http.server` à la racine du projet sert tout via HTTP. Hot reload nécessite Vite ou similaire (à ajouter avec autorisation, car c'est une dépendance).
 
-Pour importer dans un navigateur sans bundler, utilise des `<script type="module">` avec des `import` / `export`. Ou si tu préfères du JS global, fais simplement plusieurs `<script>` dans `index.html` dans l'ordre des dépendances.
+### Solveur d'atteignabilité — à synchroniser
 
-### 3. Ajouter un dev server avec hot reload
+`solver.js` est un script Node qui réplique la physique du jeu pour faire un BFS d'atteignabilité. Depuis la modularisation, les constantes physiques sont dans `js/physics.js`. Quand on touche à la physique, vérifier que le solveur reste à jour avec les bonnes valeurs avant de relancer `node build_levels.js`.
 
-Un simple `python3 -m http.server` ou `npx vite` suffit. Hot reload accéléra énormément les itérations.
+### Adaptation mobile
 
-### 4. Le solveur d'atteignabilité
+Pas testé, probablement injouable sans contrôles tactiles. Si Zélie ou Lucile veulent jouer sur tablette/téléphone, à prioriser.
 
-Garde-le. Chaque fois qu'on touche aux niveaux ou à la physique, on relance `node build_levels.js` (ou un équivalent) pour s'assurer qu'aucun objet n'est devenu inaccessible. C'est ce qui m'a permis d'éviter de livrer un niveau impossible à finir.
+### Sauvegarde localStorage
+
+Aucune actuellement : si on meurt 3 fois au niveau 4, retour au niveau 1. Facile à ajouter (5-10 min) si demandé.
+
+### Interrupteurs interactifs
+
+Demandé dans une itération passée mais jamais implémenté proprement. À reprendre si l'envie revient.
 
 ## Choses connues qui ne sont pas idéales
 
 - **Audio** : très basique, des bips synthétisés via Web Audio API. Si Sébastien le veut, on pourrait ajouter des vraies musiques d'ambiance par niveau (loop court).
 - **Sprites** : tout dessiné au canvas avec des formes géométriques. C'est volontairement stylisé/caricatural, mais si on veut monter en qualité on pourrait passer à du pixel-art (sprites PNG) plus tard.
-- **Mobile** : non testé, probablement injouable sans contrôles tactiles. Pas demandé pour l'instant mais à noter.
-- **Sauvegarde** : aucune. Si on meurt 3 fois au niveau 4, on recommence depuis le niveau 1. Sébastien n'a pas demandé de save mais ce serait facile à ajouter via localStorage.
-- **Élément interactif type "interrupteur"** : Sébastien l'a demandé dans une itération passée, mais je n'ai pas réussi à l'implémenter proprement. À reprendre si l'envie revient.
+
+(Pour mobile, sauvegarde et interrupteurs, voir "Pistes pour la suite" plus haut.)
 
 ## Historique des décisions importantes
 
