@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Frida — Labo de maniabilité</title>
+<style>
+  html, body { margin:0; padding:0; background:#1a1024; color:#f4e6c8; font-family:'Georgia',serif; height:100%; overflow:hidden; }
+  #app { display:flex; height:100vh; }
+  #left {
+    flex: 1; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; padding:12px;
+  }
+  #canvas-wrap {
+    background:#000; border:3px solid #c9a96e;
+    box-shadow:0 0 30px rgba(201,169,110,0.4);
+  }
+  canvas { display:block; image-rendering: pixelated; }
+  #hud {
+    margin-top:8px; font-size:13px; color:#aaa9a0;
+    font-family: monospace;
+  }
+  #panel {
+    width: 340px; background:#15101e; padding:14px;
+    overflow-y:auto; border-left:2px solid #c9a96e;
+    font-size:13px;
+  }
+  #panel h2 { font-size:16px; color:#f4d35e; margin:6px 0 4px 0; border-bottom:1px solid #c9a96e; padding-bottom:3px;}
+  #panel h3 { font-size:13px; color:#e94f64; margin:10px 0 3px 0; }
+  .row { display:flex; align-items:center; justify-content:space-between; margin:3px 0; }
+  .row label { flex:1; font-size:11px; color:#aaa9a0; }
+  .row input[type=range] { flex:1; margin:0 6px; }
+  .row .val { width:48px; text-align:right; color:#f4d35e; font-family:monospace; font-size:11px; }
+  .toggles label { display:block; font-size:11px; margin:2px 0; color:#f4e6c8; cursor:pointer; }
+  .toggles input { margin-right:5px; }
+  button {
+    background:#3a2a4a; color:#f4e6c8; border:1px solid #c9a96e;
+    padding:5px 9px; font-family:'Georgia',serif; font-size:11px;
+    cursor:pointer; margin:2px;
+  }
+  button:hover { background:#5a3a6a; }
+  #exportarea {
+    width:100%; height:90px; background:#000; color:#f4d35e;
+    font-family:monospace; font-size:10px; border:1px solid #c9a96e;
+    margin-top:6px; padding:4px; box-sizing:border-box; resize:none;
+  }
+  .help { font-size:10px; color:#888; font-style:italic; margin:4px 0; line-height:1.3;}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <div id="canvas-wrap">
+      <canvas id="game" width="800" height="500"></canvas>
+    </div>
+    <div id="hud">← → ZQSD : marcher | SAUT : ESPACE / ↑ | DASH : Shift | R : reset | T : téléport début</div>
+  </div>
+  <div id="panel">
+    <h2>Labo de maniabilité</h2>
+    <div class="help">Modifie les valeurs en jouant. Tout est appliqué en direct.</div>
+
+    <h3>Course</h3>
+    <div class="row"><label>Accélération sol</label><input type=range id=p_accel min="0.1" max="2" step="0.05" value="0.32"><span class=val id=v_accel></span></div>
+    <div class="row"><label>Accélération air</label><input type=range id=p_airAccel min="0.05" max="1.5" step="0.05" value="0.22"><span class=val id=v_airAccel></span></div>
+    <div class="row"><label>Vitesse max</label><input type=range id=p_max min="2" max="9" step="0.1" value="4.4"><span class=val id=v_max></span></div>
+    <div class="row"><label>Friction sol</label><input type=range id=p_fric min="0.5" max="1.0" step="0.01" value="0.86"><span class=val id=v_fric></span></div>
+    <div class="row"><label>Friction air</label><input type=range id=p_fricAir min="0.7" max="1.0" step="0.01" value="0.97"><span class=val id=v_fricAir></span></div>
+    <div class="row"><label>Mult demi-tour</label><input type=range id=p_turn min="1" max="4" step="0.1" value="1.8"><span class=val id=v_turn></span></div>
+
+    <h3>Saut</h3>
+    <div class="row"><label>Force saut</label><input type=range id=p_jumpV min="-18" max="-6" step="0.1" value="-11.4"><span class=val id=v_jumpV></span></div>
+    <div class="row"><label>Jump cut (release)</label><input type=range id=p_jcut min="0.1" max="1.0" step="0.05" value="0.42"><span class=val id=v_jcut></span></div>
+    <div class="row"><label>Gravité base</label><input type=range id=p_grav min="0.2" max="1.0" step="0.02" value="0.52"><span class=val id=v_grav></span></div>
+    <div class="row"><label>Gravité montée ×</label><input type=range id=p_gUp min="0.4" max="1.2" step="0.02" value="0.82"><span class=val id=v_gUp></span></div>
+    <div class="row"><label>Gravité chute ×</label><input type=range id=p_gDown min="0.8" max="1.8" step="0.02" value="1.08"><span class=val id=v_gDown></span></div>
+    <div class="row"><label>Apex hangtime ×</label><input type=range id=p_hang min="0.1" max="1.0" step="0.05" value="0.45"><span class=val id=v_hang></span></div>
+    <div class="row"><label>Seuil hangtime (|vy|)</label><input type=range id=p_hangT min="0" max="5" step="0.1" value="2.2"><span class=val id=v_hangT></span></div>
+    <div class="row"><label>Chute max</label><input type=range id=p_maxFall min="6" max="20" step="0.5" value="13.5"><span class=val id=v_maxFall></span></div>
+
+    <h3>Pardon</h3>
+    <div class="row"><label>Coyote (frames)</label><input type=range id=p_coyote min="0" max="14" step="1" value="7"><span class=val id=v_coyote></span></div>
+    <div class="row"><label>Jump buffer (frames)</label><input type=range id=p_buffer min="0" max="14" step="1" value="8"><span class=val id=v_buffer></span></div>
+
+    <h3 class=toggles>Mouvements optionnels</h3>
+    <div class=toggles>
+      <label><input type=checkbox id=t_wallSlide> Wall slide (glisse contre murs)</label>
+      <label><input type=checkbox id=t_wallJump> Wall jump (saut depuis mur)</label>
+      <label><input type=checkbox id=t_dash> Dash (Shift)</label>
+      <label><input type=checkbox id=t_ledgeGrab> Ledge grab (accroche bord)</label>
+      <label><input type=checkbox id=t_cornerCorr> Corner correction (snap saut)</label>
+    </div>
+    <div class="row"><label>Dash vitesse</label><input type=range id=p_dashSpeed min="3" max="16" step="0.5" value="9"><span class=val id=v_dashSpeed></span></div>
+    <div class="row"><label>Dash durée</label><input type=range id=p_dashDur min="3" max="25" step="1" value="10"><span class=val id=v_dashDur></span></div>
+    <div class="row"><label>Dash cooldown</label><input type=range id=p_dashCD min="10" max="180" step="5" value="50"><span class=val id=v_dashCD></span></div>
+    <div class="row"><label>Wall slide vitesse</label><input type=range id=p_wsSpeed min="0.5" max="6" step="0.1" value="2"><span class=val id=v_wsSpeed></span></div>
+
+    <h3>Presets</h3>
+    <div>
+      <button onclick="applyPreset('current')">Actuel jeu</button>
+      <button onclick="applyPreset('mario')">Mario-like</button>
+      <button onclick="applyPreset('celeste')">Celeste-like</button>
+      <button onclick="applyPreset('floaty')">Lourd flottant</button>
+      <button onclick="applyPreset('snappy')">Ultra réactif</button>
+    </div>
+
+    <h3>Export</h3>
+    <button onclick="exportValues()">Exporter valeurs</button>
+    <button onclick="resetRun()">R Reset position</button>
+    <textarea id="exportarea" readonly placeholder="Clique 'Exporter valeurs' quand c'est bien"></textarea>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const TILE = 32;
+
+// ====== TUNABLE PARAMETERS (read live from sliders) ======
+const P = {
+  accel: 0.32, airAccel: 0.22, max: 4.4,
+  fric: 0.86, fricAir: 0.97, turn: 1.8,
+  jumpV: -11.4, jcut: 0.42,
+  grav: 0.52, gUp: 0.82, gDown: 1.08,
+  hang: 0.45, hangT: 2.2, maxFall: 13.5,
+  coyote: 7, buffer: 8,
+  dashSpeed: 9, dashDur: 10, dashCD: 50,
+  wsSpeed: 2,
+};
+const T = {
+  wallSlide: false, wallJump: false, dash: false,
+  ledgeGrab: false, cornerCorr: false,
+};
+
+// Bind sliders to P
+function bindSlider(id, key, fmt = v => v.toFixed(2)) {
+  const el = document.getElementById(id);
+  const val = document.getElementById(id.replace('p_','v_'));
+  function sync() { P[key] = parseFloat(el.value); val.textContent = fmt(P[key]); }
+  el.addEventListener('input', sync); sync();
+}
+[
+  ['p_accel','accel'], ['p_airAccel','airAccel'], ['p_max','max'],
+  ['p_fric','fric'], ['p_fricAir','fricAir'], ['p_turn','turn'],
+  ['p_jumpV','jumpV'], ['p_jcut','jcut'],
+  ['p_grav','grav'], ['p_gUp','gUp'], ['p_gDown','gDown'],
+  ['p_hang','hang'], ['p_hangT','hangT'], ['p_maxFall','maxFall'],
+  ['p_coyote','coyote','i'], ['p_buffer','buffer','i'],
+  ['p_dashSpeed','dashSpeed'], ['p_dashDur','dashDur','i'], ['p_dashCD','dashCD','i'],
+  ['p_wsSpeed','wsSpeed'],
+].forEach(([id,key,fmt]) => bindSlider(id, key, fmt === 'i' ? v => v.toFixed(0) : undefined));
+
+// Toggles
+['wallSlide','wallJump','dash','ledgeGrab','cornerCorr'].forEach(k => {
+  const el = document.getElementById('t_' + k);
+  el.addEventListener('change', () => T[k] = el.checked);
+});
+
+// ====== PRESETS ======
+const PRESETS = {
+  current: { accel:0.32, airAccel:0.22, max:4.4, fric:0.86, fricAir:0.97, turn:1.8,
+             jumpV:-11.4, jcut:0.42, grav:0.52, gUp:0.82, gDown:1.08,
+             hang:0.45, hangT:2.2, maxFall:13.5, coyote:7, buffer:8,
+             toggles:{} },
+  mario:   { accel:0.55, airAccel:0.4, max:5.5, fric:0.88, fricAir:0.96, turn:2.2,
+             jumpV:-12.5, jcut:0.5, grav:0.6, gUp:0.85, gDown:1.15,
+             hang:0.6, hangT:1.5, maxFall:14, coyote:4, buffer:5,
+             toggles:{cornerCorr:true} },
+  celeste: { accel:0.9, airAccel:0.7, max:5.0, fric:0.7, fricAir:0.92, turn:3.0,
+             jumpV:-11.0, jcut:0.35, grav:0.7, gUp:0.7, gDown:1.3,
+             hang:0.3, hangT:1.0, maxFall:14, coyote:6, buffer:7,
+             toggles:{dash:true, wallJump:true, wallSlide:true, cornerCorr:true} },
+  floaty:  { accel:0.25, airAccel:0.18, max:3.8, fric:0.9, fricAir:0.985, turn:1.4,
+             jumpV:-10.5, jcut:0.55, grav:0.38, gUp:0.65, gDown:0.95,
+             hang:0.35, hangT:3.0, maxFall:10, coyote:9, buffer:10,
+             toggles:{} },
+  snappy:  { accel:1.2, airAccel:0.9, max:5.2, fric:0.78, fricAir:0.94, turn:3.5,
+             jumpV:-11.6, jcut:0.3, grav:0.6, gUp:0.78, gDown:1.25,
+             hang:0.5, hangT:1.5, maxFall:15, coyote:5, buffer:6,
+             toggles:{cornerCorr:true} },
+};
+function applyPreset(name) {
+  const p = PRESETS[name]; if (!p) return;
+  for (const [k,v] of Object.entries(p)) {
+    if (k === 'toggles') continue;
+    const el = document.getElementById('p_' + k);
+    if (el) { el.value = v; el.dispatchEvent(new Event('input')); }
+  }
+  ['wallSlide','wallJump','dash','ledgeGrab','cornerCorr'].forEach(k => {
+    const el = document.getElementById('t_'+k);
+    el.checked = !!(p.toggles && p.toggles[k]);
+    T[k] = el.checked;
+  });
+}
+window.applyPreset = applyPreset;
+
+function exportValues() {
+  const obj = { ...P, toggles: {...T} };
+  document.getElementById('exportarea').value = JSON.stringify(obj, null, 2);
+}
+window.exportValues = exportValues;
+
+// ====== INPUT ======
+const keys = {}, keyDown = {};
+window.addEventListener('keydown', e => {
+  if (['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+  if (!keys[e.code]) keyDown[e.code] = true;
+  keys[e.code] = true;
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+function pressed(...c) { return c.some(x => keys[x]); }
+function justPressed(c) { const p = keyDown[c]; keyDown[c] = false; return p; }
+
+// ====== TEST LEVEL ======
+// Width 25 tiles = 800px, height ~15.625 tiles. Use 15.
+const LVL_W = 25, LVL_H = 15;
+const RAW = [
+  // 0
+  ".........................",
+  ".........................",
+  ".........................",
+  ".........................",
+  ".....=====...............",   // 4 — plat haute
+  ".........................",
+  "...........====..........",   // 6 — plat moyenne
+  "................==.......",   // 7 — petite plat
+  ".........................",
+  ".....=====....|..........",   // 9 — plat + mur vertical pour wall-jump
+  ".............|...........",
+  ".............|...........",
+  ".............|...........",
+  "####...####....####.#####",   // 13 - sol avec gaps (gap 3, 4, 1)
+  "#########################",
+];
+const grid = RAW.map(r => r.split(''));
+function tileAt(tx, ty) {
+  if (ty<0||ty>=LVL_H||tx<0||tx>=LVL_W) return '.';
+  return grid[ty][tx];
+}
+const SOLIDS = new Set(['#','=','|']);
+function isSolid(c) { return SOLIDS.has(c); }
+
+// ====== PLAYER ======
+const SPAWN = { x: 1.5*TILE, y: 12*TILE };
+const player = {
+  x: SPAWN.x, y: SPAWN.y, w: 22, h: 30,
+  vx: 0, vy: 0,
+  onGround: false, facing: 1,
+  jumpHeld: false, coyote: 0, jumpBuffer: 0,
+  wallSliding: false, wallSide: 0,
+  dashCD: 0, dashing: 0, dashedInAir: false,
+  ledgeGrabbed: false,
+  // metrics
+  airTime: 0, maxAirTime: 0,
+  resets: 0, jumps: 0,
+};
+function reset() { player.x = SPAWN.x; player.y = SPAWN.y; player.vx = 0; player.vy = 0; player.onGround = false; player.coyote=0; player.jumpBuffer=0; player.dashCD=0; player.dashing=0; player.resets++; player.airTime=0; }
+window.resetRun = reset;
+
+// ====== COLLISION (axis-by-axis) ======
+const BBX = 3;
+function moveX(p) {
+  p.x += p.vx;
+  const bbx = p.x + BBX, bbw = p.w - 2*BBX;
+  if (p.vx > 0) {
+    const tx = Math.floor((bbx + bbw) / TILE);
+    const y1 = Math.floor(p.y / TILE), y2 = Math.floor((p.y + p.h - 1) / TILE);
+    for (let ty=y1; ty<=y2; ty++) {
+      if (isSolid(tileAt(tx, ty))) {
+        p.x = tx*TILE - bbw - BBX; p.vx = 0; p.wallSide = 1; return;
+      }
+    }
+  } else if (p.vx < 0) {
+    const tx = Math.floor(bbx / TILE);
+    const y1 = Math.floor(p.y / TILE), y2 = Math.floor((p.y + p.h - 1) / TILE);
+    for (let ty=y1; ty<=y2; ty++) {
+      if (isSolid(tileAt(tx, ty))) {
+        p.x = (tx+1)*TILE - BBX; p.vx = 0; p.wallSide = -1; return;
+      }
+    }
+  }
+  p.wallSide = 0;
+}
+function moveY(p) {
+  p.y += p.vy;
+  p.onGround = false;
+  const bbx = p.x + BBX, bbw = p.w - 2*BBX;
+  if (p.vy > 0) {
+    const ty = Math.floor((p.y + p.h) / TILE);
+    const x1 = Math.floor(bbx / TILE), x2 = Math.floor((bbx + bbw - 1) / TILE);
+    for (let tx=x1; tx<=x2; tx++) {
+      if (isSolid(tileAt(tx, ty))) { p.y = ty*TILE - p.h; p.vy = 0; p.onGround = true; return; }
+    }
+  } else if (p.vy < 0) {
+    const ty = Math.floor(p.y / TILE);
+    const x1 = Math.floor(bbx / TILE), x2 = Math.floor((bbx + bbw - 1) / TILE);
+    for (let tx=x1; tx<=x2; tx++) {
+      if (isSolid(tileAt(tx, ty))) {
+        // CORNER CORRECTION : if there's room to "nudge" left/right by a few px to fit, do it
+        if (T.cornerCorr) {
+          const leftClear = !isSolid(tileAt(x1 - 1, ty));
+          const rightClear = !isSolid(tileAt(x2 + 1, ty));
+          const playerLeftEdge = bbx - x1*TILE;          // px past tile boundary on left
+          const playerRightEdge = (x2+1)*TILE - (bbx+bbw); // px past tile boundary on right
+          // If only the left part is hitting the corner and the right is mostly clear, nudge left
+          if (x1 === x2) {
+            // single tile collision - can't really correct
+          } else {
+            // Try nudge: if left tile is solid but right is air, nudge right
+            if (isSolid(tileAt(x1, ty)) && !isSolid(tileAt(x2, ty)) && playerLeftEdge < 8) {
+              p.x += (TILE - playerLeftEdge);
+              p.y -= p.vy; // undo y move and let it move again
+              p.vy *= 0.5; return;
+            }
+            if (!isSolid(tileAt(x1, ty)) && isSolid(tileAt(x2, ty)) && playerRightEdge < 8) {
+              p.x -= (TILE - playerRightEdge);
+              p.y -= p.vy; p.vy *= 0.5; return;
+            }
+          }
+        }
+        p.y = (ty+1)*TILE; p.vy = 0; return;
+      }
+    }
+  }
+}
+
+// ====== STEP ======
+function step() {
+  // Reset key
+  if (justPressed('KeyR') || justPressed('KeyT')) reset();
+
+  const p = player;
+  const left = pressed('ArrowLeft','KeyA','KeyQ');
+  const right = pressed('ArrowRight','KeyD');
+  const jumpHeldNow = pressed('Space','ArrowUp','KeyW','KeyZ');
+  const dashKey = justPressed('ShiftLeft') || justPressed('ShiftRight');
+  const jumpKey = justPressed('Space') || justPressed('ArrowUp') || justPressed('KeyW') || justPressed('KeyZ');
+
+  // Dash handling (during dash, ignore normal physics)
+  if (T.dash && p.dashing > 0) {
+    p.dashing--;
+    p.vy = 0;
+    p.vx = p.dashSpeedSign * P.dashSpeed;
+    moveX(p);
+    if (p.dashing === 0) { p.vx *= 0.5; }
+  } else {
+    if (p.dashCD > 0) p.dashCD--;
+    if (T.dash && dashKey && p.dashCD <= 0 && !p.dashedInAir) {
+      const dir = right ? 1 : (left ? -1 : p.facing);
+      p.dashing = P.dashDur; p.dashSpeedSign = dir;
+      p.dashCD = P.dashCD;
+      if (!p.onGround) p.dashedInAir = true;
+    }
+    if (p.onGround) p.dashedInAir = false;
+
+    // ---- Wall slide detection ----
+    p.wallSliding = false;
+    if (T.wallSlide && !p.onGround) {
+      // are we pressing into a wall?
+      if (right && checkWall(p, 1)) { p.wallSliding = true; p.wallFacing = 1; }
+      else if (left && checkWall(p, -1)) { p.wallSliding = true; p.wallFacing = -1; }
+    }
+
+    // ---- Horizontal input ----
+    const accel = p.onGround ? P.accel : P.airAccel;
+    const fric  = p.onGround ? P.fric : P.fricAir;
+    if (left && !right) {
+      if (p.vx > 0) p.vx -= accel * P.turn; else p.vx -= accel;
+      p.facing = -1;
+    } else if (right && !left) {
+      if (p.vx < 0) p.vx += accel * P.turn; else p.vx += accel;
+      p.facing = 1;
+    } else {
+      p.vx *= fric;
+      if (Math.abs(p.vx) < 0.12) p.vx = 0;
+    }
+    if (p.vx >  P.max) p.vx =  P.max;
+    if (p.vx < -P.max) p.vx = -P.max;
+
+    // Coyote + buffer
+    if (p.onGround) p.coyote = P.coyote; else if (p.coyote > 0) p.coyote--;
+    if (jumpKey) p.jumpBuffer = P.buffer;
+    if (p.jumpBuffer > 0) p.jumpBuffer--;
+
+    // ---- Trigger jump ----
+    if (p.jumpBuffer > 0 && (p.onGround || p.coyote > 0)) {
+      p.vy = P.jumpV; p.onGround = false; p.coyote = 0; p.jumpBuffer = 0; p.jumpHeld = true; p.jumps++;
+    }
+    // Wall jump
+    else if (T.wallJump && p.jumpBuffer > 0 && p.wallSliding) {
+      p.vy = P.jumpV; p.vx = -p.wallFacing * P.max; p.facing = -p.wallFacing;
+      p.jumpBuffer = 0; p.jumpHeld = true; p.jumps++; p.wallSliding = false;
+    }
+
+    // Variable jump cut
+    if (!jumpHeldNow && p.vy < 0 && p.jumpHeld) {
+      p.vy *= P.jcut; p.jumpHeld = false;
+    }
+
+    // ---- Gravity (with hangtime + asymmetric) ----
+    let g;
+    if (Math.abs(p.vy) < P.hangT && !p.onGround) g = P.grav * P.hang;
+    else if (p.vy < 0 && p.jumpHeld)             g = P.grav * P.gUp;
+    else if (p.vy > 0)                           g = P.grav * P.gDown;
+    else                                          g = P.grav;
+    p.vy += g;
+
+    // Wall slide caps fall speed
+    if (p.wallSliding && p.vy > P.wsSpeed) p.vy = P.wsSpeed;
+
+    if (p.vy > P.maxFall) p.vy = P.maxFall;
+
+    moveX(p);
+    moveY(p);
+  }
+
+  // Air time tracking
+  if (p.onGround) { p.airTime = 0; } else { p.airTime++; if (p.airTime > p.maxAirTime) p.maxAirTime = p.airTime; }
+
+  // Pit reset
+  if (p.y > H + 100) reset();
+}
+
+function checkWall(p, dir) {
+  const bbx = p.x + BBX, bbw = p.w - 2*BBX;
+  const tx = dir > 0 ? Math.floor((bbx + bbw + 1) / TILE) : Math.floor((bbx - 1) / TILE);
+  const y1 = Math.floor(p.y / TILE), y2 = Math.floor((p.y + p.h - 1) / TILE);
+  for (let ty=y1; ty<=y2; ty++) if (isSolid(tileAt(tx, ty))) return true;
+  return false;
+}
+
+// ====== RENDER ======
+function drawTile(c, px, py) {
+  if (c === '#') {
+    ctx.fillStyle = '#5a4838'; ctx.fillRect(px, py, TILE, TILE);
+    ctx.fillStyle = '#7a6450'; ctx.fillRect(px, py, TILE, 4);
+    ctx.fillStyle = '#3a2a1a'; ctx.fillRect(px, py+TILE-2, TILE, 2);
+  } else if (c === '=') {
+    ctx.fillStyle = '#7a4030'; ctx.fillRect(px, py, TILE, TILE);
+    ctx.fillStyle = '#a86048'; ctx.fillRect(px, py, TILE, 3);
+    ctx.fillStyle = '#3a2010'; ctx.fillRect(px+TILE-2, py, 2, TILE);
+  } else if (c === '|') {
+    ctx.fillStyle = '#3a3a4a'; ctx.fillRect(px, py, TILE, TILE);
+    ctx.fillStyle = '#5a5a6a'; ctx.fillRect(px, py, 4, TILE);
+    ctx.fillStyle = '#1a1a2a'; ctx.fillRect(px+TILE-4, py, 4, TILE);
+  }
+}
+
+function drawFrida(p) {
+  // Simplified Frida - red dress, dark hair, unibrow
+  ctx.save();
+  ctx.translate(p.x + p.w/2, p.y + p.h/2);
+  ctx.scale(p.facing, 1);
+  // body (dress)
+  ctx.fillStyle = '#c83030';
+  ctx.beginPath();
+  ctx.moveTo(-10, 14); ctx.lineTo(-7, -2); ctx.lineTo(7, -2); ctx.lineTo(10, 14);
+  ctx.closePath(); ctx.fill();
+  // head
+  ctx.fillStyle = '#b87858';
+  ctx.beginPath(); ctx.ellipse(0, -8, 7, 8, 0, 0, Math.PI*2); ctx.fill();
+  // hair
+  ctx.fillStyle = '#1a0e0a';
+  ctx.beginPath(); ctx.ellipse(0, -11, 9, 5, 0, Math.PI, 0); ctx.fill();
+  ctx.beginPath(); ctx.arc(-2, -18, 5, 0, Math.PI*2); ctx.fill();
+  // unibrow
+  ctx.fillStyle = '#0a0500';
+  ctx.fillRect(-6, -11, 12, 2);
+  // eyes
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-4, -9, 2, 2);
+  ctx.fillRect(2, -9, 2, 2);
+  // lips
+  ctx.fillStyle = '#a8203a';
+  ctx.fillRect(-3, -4, 6, 1.5);
+  // legs
+  ctx.fillStyle = '#a06848';
+  ctx.fillRect(-5, 13, 4, 3);
+  ctx.fillRect(1, 13, 4, 3);
+  ctx.restore();
+
+  // State indicators
+  if (p.wallSliding) {
+    ctx.strokeStyle = '#88ccff'; ctx.lineWidth = 2;
+    ctx.strokeRect(p.x-1, p.y-1, p.w+2, p.h+2);
+  }
+  if (p.dashing > 0) {
+    ctx.fillStyle = `rgba(255, 220, 80, ${p.dashing/P.dashDur * 0.6})`;
+    ctx.fillRect(p.x-12*p.dashSpeedSign, p.y, 12, p.h);
+  }
+}
+
+function render() {
+  // sky bg
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,'#2a1e3a');
+  grad.addColorStop(1,'#5a4a6a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,W,H);
+
+  // tiles
+  for (let y=0; y<LVL_H; y++) for (let x=0; x<LVL_W; x++) drawTile(grid[y][x], x*TILE, y*TILE);
+
+  // Visual guides : show gap widths
+  ctx.fillStyle = 'rgba(244, 211, 94, 0.5)'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+  // gap 1 between col 4 and 7 (cols 4-6 empty) = 3 tiles
+  ctx.fillText('3 tiles', 5.5*TILE, 13*TILE - 4);
+  ctx.fillText('4 tiles', 13*TILE, 13*TILE - 4);
+
+  drawFrida(player);
+
+  // HUD overlay
+  ctx.font = '12px monospace'; ctx.fillStyle = '#f4d35e'; ctx.textAlign = 'left';
+  ctx.fillText(`vx ${player.vx.toFixed(2).padStart(6)} | vy ${player.vy.toFixed(2).padStart(6)}`, 8, 16);
+  ctx.fillText(`state: ${player.onGround?'GROUND':player.wallSliding?'WALLSLIDE':player.dashing>0?'DASH':'AIR'}`, 8, 32);
+  ctx.fillText(`coyote ${player.coyote} | buffer ${player.jumpBuffer} | dashCD ${player.dashCD}`, 8, 48);
+  ctx.fillText(`max airTime ${player.maxAirTime}f (${(player.maxAirTime/60).toFixed(2)}s)`, 8, 64);
+  ctx.fillText(`jumps ${player.jumps} | resets ${player.resets}`, 8, 80);
+
+  // theoretical jump info
+  const apexT = Math.abs(P.jumpV / (P.grav * P.gUp));
+  const apexH = (P.jumpV * P.jumpV) / (2 * P.grav * P.gUp);
+  const apexTiles = apexH / TILE;
+  ctx.fillStyle = '#aaa9a0';
+  ctx.fillText(`saut max théorique: ~${apexTiles.toFixed(1)} tiles (${(apexT/60).toFixed(2)}s ↑)`, 8, H-10);
+}
+
+function loop() { step(); render(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>

@@ -1,0 +1,4439 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Frida à Londres - L'odyssée victorienne</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #1a0f1f;
+    color: #f4e6c8;
+    font-family: 'Georgia', serif;
+    overflow: hidden;
+    height: 100%;
+    user-select: none;
+  }
+  #wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+  }
+  #game {
+    background: #87729a;
+    image-rendering: pixelated;
+    border: 6px double #c9a96e;
+    box-shadow: 0 0 40px rgba(201, 169, 110, 0.5), 0 0 80px rgba(0,0,0,0.8);
+    max-width: 100%;
+    max-height: 90vh;
+  }
+  #footer {
+    margin-top: 12px;
+    text-align: center;
+    font-size: 13px;
+    color: #c9a96e;
+    letter-spacing: 1px;
+  }
+  #footer b { color: #f4e6c8; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="footer">
+    ← → ou A/D : marcher &nbsp;•&nbsp; <b>ESPACE</b> ou ↑ : sauter &nbsp;•&nbsp; <b>P</b> : pause &nbsp;•&nbsp; <b>R</b> : recommencer le niveau
+  </div>
+</div>
+<script>
+"use strict";
+
+// ============================================================================
+//  FRIDA À LONDRES — L'odyssée victorienne
+//  Un platformer caricatural dans l'Angleterre du 19e siècle
+// ============================================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+const TILE = 32;
+
+// ----------------------------------------------------------------------------
+//  INPUT
+// ----------------------------------------------------------------------------
+const keys = {};
+const keyPressed = {};
+window.addEventListener('keydown', e => {
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  if (!keys[e.code]) keyPressed[e.code] = true;
+  keys[e.code] = true;
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function consume(code) {
+  const p = keyPressed[code];
+  keyPressed[code] = false;
+  return p;
+}
+function pressing(...codes) { return codes.some(c => keys[c]); }
+
+// ----------------------------------------------------------------------------
+//  AUDIO (petits bips synthétisés)
+// ----------------------------------------------------------------------------
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  }
+}
+function blip(freq, dur, type='square', vol=0.08) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.value = vol;
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + dur);
+}
+const SFX = {
+  jump:   () => blip(440, 0.12, 'square'),
+  stomp:  () => { blip(220, 0.08); setTimeout(()=>blip(110,0.1),60); },
+  coin:   () => { blip(880, 0.06); setTimeout(()=>blip(1320,0.08),60); },
+  hit:    () => blip(140, 0.25, 'sawtooth', 0.12),
+  win:    () => { [523,659,784,1047].forEach((f,i)=>setTimeout(()=>blip(f,0.15,'triangle',0.1),i*120)); },
+  lose:   () => { [400,300,200,120].forEach((f,i)=>setTimeout(()=>blip(f,0.2,'sawtooth',0.1),i*150)); },
+};
+
+// ----------------------------------------------------------------------------
+//  TILE LEGEND
+//  . = vide       # = sol/pavé      = = brique        ^ = pique
+//  ? = bloc bonus o = piece (thé)   S = scone (life)  F = drapeau de fin
+//  | = lampadaire/poutre verticale  - = poutre horizontale
+//  G = engrenage (mortel rotatif)   ~ = nuage de smog (toxique)
+//  T = tonneau (plateforme)         B = banc / muret
+// ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+//  LEVELS — chaque ligne = 1 rangée, chaque caractère = 1 tile (32px)
+//  Hauteur: 17 tiles (544px), largeur variable
+// ----------------------------------------------------------------------------
+const RAW_LEVELS = [
+  {
+    name: "Les Ruelles de Londres",
+    subtitle: "Où Frida découvre la pluie et les pavés",
+    theme: "london",
+    music: "london",
+    map: [
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "...........................................................................S........................",
+      "..........................................................................====......................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "..........................oo..................oo.....................oo...?..................oo.....",
+      ".........................====...............======.................======...................====....",
+      "..........oo.........oo.....?.........oo..........?...........oo......................oo............",
+      ".........====.......====............======..................======..................======..........",
+      "..............?................o.........................o.......................o..................",
+      "............................................................................^....................F..",
+      "##############################...#######################...######################..#################",
+      "##############################...#######################...######################..#################",
+    ],
+    bg: "london",
+    enemies: [
+      {"type":"bobby","x":20,"y":14},
+      {"type":"sweep","x":42,"y":14},
+      {"type":"bobby","x":66,"y":14},
+      {"type":"smog","x":50,"y":6},
+      {"type":"sweep","x":88,"y":14},
+    ],
+    powerups: [
+      { kind: 'ribbon', x: 26, y: 9 },
+      { kind: 'shawl',  x: 62, y: 11 },
+    ],
+    extras: [
+      { kind: 'lantern', x:  8, y: 14 },
+      { kind: 'lantern', x: 22, y: 14 },
+      { kind: 'lantern', x: 40, y: 14 },
+      { kind: 'lantern', x: 70, y: 14 },
+      { kind: 'lantern', x: 90, y: 14 },
+    ],
+    start: {"x":3,"y":13},
+  },
+  {
+    name: "L'Usine à Vapeur",
+    subtitle: "Engrenages, suie et patrons en haut-de-forme",
+    theme: "factory",
+    music: "factory",
+    map: [
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      ".................................................o..............................S...................",
+      ".................................................==............................====.................",
+      "....................................................................................................",
+      "...........................................................................o........................",
+      "........................................oo..?..====......................=====?.....................",
+      "..............oo.......................====...........................oo..............oo............",
+      ".............====..................oo...............====............======..........======..........",
+      "......oo..........................====..........................oo..................................",
+      ".....====.?..................o.==.....................o.....o.======.....................o.o........",
+      "......................G.........................................................^............G...F..",
+      "############################...#########################...#########################################",
+      "############################...#########################...#########################################",
+    ],
+    bg: "factory",
+    enemies: [
+      {"type":"topboss","x":18,"y":14},
+      {"type":"sweep","x":45,"y":8},
+      {"type":"smog","x":50,"y":4},
+      {"type":"topboss","x":70,"y":14},
+      {"type":"sweep","x":87,"y":14},
+    ],
+    powerups: [
+      { kind: 'shawl',  x: 35, y: 11 },
+      { kind: 'crown',  x: 79, y: 5 },
+    ],
+    extras: [
+      { kind: 'gear', x:  5, y: 14 },
+      { kind: 'gear', x: 38, y: 14 },
+      { kind: 'gear', x: 50, y: 14 },
+      { kind: 'gear', x: 70, y: 14 },
+      { kind: 'gear', x: 88, y: 14 },
+    ],
+    start: {"x":2,"y":14},
+  },
+  {
+    name: "La Lande Brumeuse",
+    subtitle: "Moutons, chiens des Baskerville et collines bossues",
+    theme: "moor",
+    music: "moor",
+    map: [
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................................................",
+      "....................................................................S...............................",
+      "............................................?.......................====...........?................",
+      "................................oo.........................................................oo.......",
+      ".................oo...........======......======.....ooo......oo...====.........======....====......",
+      "................====..ooooo.........................#####...======......ooo.........................",
+      "..........ooo.......#########.......................#####.............#######.......................",
+      "........#######.....#########.....#####......^......#####........^....#######........####........F..",
+      "####################################################################################################",
+      "####################################################################################################",
+    ],
+    bg: "moor",
+    enemies: [
+      {"type":"sheep","x":10,"y":13},
+      {"type":"dog","x":25,"y":11},
+      {"type":"sheep","x":38,"y":13},
+      {"type":"dog","x":50,"y":13},
+      {"type":"dog","x":73,"y":11},
+      {"type":"sheep","x":88,"y":13},
+    ],
+    powerups: [
+      { kind: 'ribbon', x: 32, y: 7 },
+      { kind: 'crown',  x: 67, y: 10 },
+    ],
+    extras: [
+      { kind: 'rose', x:  4, y: 14 },
+      { kind: 'rose', x: 30, y: 14 },
+      { kind: 'rose', x: 50, y: 14 },
+      { kind: 'rose', x: 65, y: 14 },
+      { kind: 'rose', x: 93, y: 14 },
+    ],
+    start: {"x":2,"y":14},
+  },
+  {
+    name: "Le Sommet de Big Ben",
+    subtitle: "Et Frida face à la Reine Victorienne",
+    theme: "bigben",
+    music: "bigben",
+    map: [
+      "....................................................................................",
+      "....................................................................................",
+      ".......................................................oo....S......................",
+      ".................................................o...======.====....................",
+      ".......................................?....oo..====................................",
+      "..........................................======....................................",
+      "....................................======..........................................",
+      "...........................?....oo..................................................",
+      "..............................======................................................",
+      "...............?....oo..======......................................................",
+      "..................======............................................................",
+      "......oo....======..................................................................",
+      "....======..........................................................................",
+      "...............................................................=======oooooooo=====.",
+      "...................^.............^.............^^.................................F.",
+      "####################################################################################",
+      "####################################################################################",
+    ],
+    bg: "bigben",
+    enemies: [
+      {"type":"guard","x":8,"y":14},
+      {"type":"guard","x":30,"y":14},
+      {"type":"smog","x":25,"y":4},
+      {"type":"smog","x":55,"y":3},
+      {"type":"queen","x":72,"y":12},
+    ],
+    powerups: [
+      { kind: 'ribbon', x: 20, y: 10 },
+      { kind: 'crown',  x: 60, y: 13 },
+    ],
+    extras: [
+      { kind: 'brush', x:  6, y: 14 },
+      { kind: 'brush', x: 25, y: 14 },
+      { kind: 'brush', x: 45, y: 14 },
+      { kind: 'brush', x: 65, y: 14 },
+      { kind: 'brush', x: 80, y: 14 },
+    ],
+    start: {"x":2,"y":14},
+  },
+];
+
+// ----------------------------------------------------------------------------
+//  WORLD - parsed level data
+// ----------------------------------------------------------------------------
+function parseLevel(raw) {
+  const rows = raw.map.map(r => r.split(''));
+  const h = rows.length;
+  const w = Math.max(...rows.map(r => r.length));
+  // pad
+  rows.forEach(r => { while (r.length < w) r.push('.'); });
+  return {
+    ...raw,
+    grid: rows,
+    w, h,
+    pixelW: w * TILE,
+    pixelH: h * TILE,
+  };
+}
+const LEVELS = RAW_LEVELS.map(parseLevel);
+
+// ----------------------------------------------------------------------------
+//  GAME STATE
+// ----------------------------------------------------------------------------
+const game = {
+  state: 'title',
+  levelIdx: 0,
+  level: null,
+  player: null,
+  enemies: [],
+  pickups: [],
+  particles: [],
+  floatTexts: [],
+  enemyChatter: [],
+  camera: { x: 0, y: 0 },
+  score: 0,
+  lives: 3,
+  totalCoins: 0,
+  time: 0,
+  intermissionTimer: 0,
+  shake: 0,
+  flashRed: 0,
+  flashGold: 0,
+  message: '',
+  messageTimer: 0,
+  bossKilled: false,
+  // Per-level themed object counters + decor flags
+  collected:       { tea:0, lantern:0, gear:0, rose:0, brush:0 },
+  decorTriggered:  { tea:false, lantern:false, gear:false, rose:false, brush:false },
+  decorTransition: 0,   // animates 0->1 when decor flips
+  // Power selection
+  selectedPower: null,  // 'ribbon' | 'shawl' | 'crown'
+  // Frida QA state
+  qaIdx: 0, qaAnswered: -1, qaPhase: 'asking', // 'asking' | 'reply'
+};
+
+// Per-level object objectives (must collect this many to trigger decor change)
+const OBJECTIVES = { tea: 10, lantern: 5, gear: 5, rose: 5, brush: 5 };
+
+// Which themed object goes with which level (by index)
+const LEVEL_THEME_OBJECT = ['lantern', 'gear', 'rose', 'brush'];
+
+// ============================================================================
+// FRIDA QUESTIONS — one shown BEFORE each level (so 4 entries: idx 0..3)
+// ============================================================================
+const FRIDA_QUESTIONS = [
+  {
+    intro: "Bienvenue, ma chère. Avant que tu n'arpentes les pavés de Londres, dis-moi :",
+    question: "Pourquoi suis-je venue affronter cette ville pluvieuse ?",
+    answers: [
+      { text: "Pour secouer leurs traditions poussiéreuses", correct: true,
+        reply: "¡Exacto! Les Anglais ont besoin de couleur. Et de m'écouter." },
+      { text: "Pour boire toute leur réserve de thé", correct: false,
+        reply: "Tentant, mais non. Quoique..." },
+      { text: "Pour épouser un duc", correct: false,
+        reply: "Ha ! J'ai déjà un Diego, ça suffit largement." },
+    ],
+  },
+  {
+    intro: "Bravo pour les ruelles. Mais l'usine à vapeur t'attend.",
+    question: "Sais-tu ce qu'est le smog ?",
+    answers: [
+      { text: "Un nuage de pollution noire", correct: true,
+        reply: "Voilà. Évite-le, il est mortel comme un mari jaloux." },
+      { text: "Une danse écossaise", correct: false,
+        reply: "Charmant, mais non !" },
+      { text: "Une marque de thé", correct: false,
+        reply: "Ha ! Tu confonds avec tes théières." },
+    ],
+  },
+  {
+    intro: "L'usine est domptée. Maintenant la lande brumeuse, et ses créatures...",
+    question: "Que vais-je y croiser ?",
+    answers: [
+      { text: "Des moutons et un chien démoniaque", correct: true,
+        reply: "Sí. Méfie-toi du chien des Baskerville, il a faim." },
+      { text: "Un dragon gallois", correct: false,
+        reply: "On n'est pas dans cette histoire-là." },
+      { text: "Des fées du marais", correct: false,
+        reply: "Trop joli pour cette lande sinistre." },
+    ],
+  },
+  {
+    intro: "Tu y es presque. Big Ben, son sommet, et la Reine.",
+    question: "Quelle est ma véritable arme face à la Couronne ?",
+    answers: [
+      { text: "Ma peinture et mon refus", correct: true,
+        reply: "¡Sí! L'art désarme les monarques mieux qu'un sabre." },
+      { text: "Mon thé bouillant", correct: false,
+        reply: "Inutile, elle en boit dix fois par jour." },
+      { text: "Un nœud papillon", correct: false,
+        reply: "Tu te moques de moi ?" },
+    ],
+  },
+];
+
+// ============================================================================
+// POWER POOL — 10 pouvoirs, 3 tirés au hasard à chaque début de niveau
+// ============================================================================
+const POWER_POOL = [
+  { kind: 'ribbon',     icon:'ribbon',    name: 'RUBAN ROUGE',       desc: 'Double saut — réappuie SAUT en l\'air',                       color: '#e94f64' },
+  { kind: 'shawl',      icon:'shawl',     name: 'CHÂLE TEHUANA',     desc: 'Sprint — vitesse de course nettement augmentée',              color: '#1a5aa8' },
+  { kind: 'crown',      icon:'crown',     name: 'COURONNE FLEURIE',  desc: 'Invincibilité — 30s d\'immunité dès le début',                color: '#f4d35e' },
+  { kind: 'fireball',   icon:'fire',      name: 'FLAMMES DU CŒUR',   desc: 'Appuie sur F pour lancer une boule de feu',                   color: '#ff6622' },
+  { kind: 'fly',        icon:'wing',      name: 'AILES DE COLOMBE',  desc: 'Maintiens SAUT en l\'air pour planer doucement',              color: '#aaccff' },
+  { kind: 'magnet',     icon:'magnet',    name: 'CŒUR MAGNÉTIQUE',   desc: 'Les théières alentour sont attirées vers toi',                color: '#cc44dd' },
+  { kind: 'slowmo',     icon:'hourglass', name: 'MEZCAL DE OAXACA',  desc: 'Les ennemis bougent au ralenti',                              color: '#88cc44' },
+  { kind: 'scoreboost', icon:'skull',     name: 'CALAVERA DORÉE',    desc: 'Chaque théière vaut TROIS fois plus',                         color: '#ffddaa' },
+  { kind: 'groundpound',icon:'boot',      name: 'TALON FERRÉ',       desc: 'En l\'air, appuie BAS pour frapper le sol et tuer autour',    color: '#888888' },
+  { kind: 'brushcrea',  icon:'brush',     name: 'PINCEAU MAGIQUE',   desc: 'Appuie sur F pour peindre une plateforme sous tes pieds',     color: '#dd2244' },
+];
+
+// Tirage de 3 pouvoirs au hasard sans répétition
+function rollPowerChoices() {
+  const pool = POWER_POOL.slice();
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const idx = Math.floor(Math.random() * pool.length);
+    out.push(pool[idx]);
+    pool.splice(idx, 1);
+  }
+  game.powerChoicesForLevel = out;
+}
+
+// ============================================================================
+//  FRIDA QA SCREEN — Frida poses a question, player picks 1/2/3
+// ============================================================================
+function drawFridaQA(t) {
+  drawLondonBG(t);
+  ctx.fillStyle = 'rgba(20, 10, 25, 0.78)';
+  ctx.fillRect(0, 0, W, H);
+  // Card
+  const cardX = 60, cardY = 60, cardW = W-120, cardH = H-120;
+  ctx.fillStyle = 'rgba(244,230,200,0.98)';
+  ctx.fillRect(cardX, cardY, cardW, cardH);
+  ctx.strokeStyle = '#3a2010'; ctx.lineWidth = 3;
+  ctx.strokeRect(cardX, cardY, cardW, cardH);
+  ctx.strokeStyle = '#c9a96e'; ctx.lineWidth = 1;
+  ctx.strokeRect(cardX+6, cardY+6, cardW-12, cardH-12);
+  // Frida portrait left
+  ctx.save();
+  ctx.translate(cardX+110, cardY+170);
+  ctx.scale(3.2, 3.2);
+  const fakeP = { x:-11, y:-15, w:22, h:30, facing:1, walkPhase:0, onGround:true,
+                  invuln:0, powerSprint:0, powerInvinc:0, powerDoubleJump:0, hairFlow:t*0.1 };
+  drawFrida(fakeP, t);
+  ctx.restore();
+  // Decorative flowers
+  drawFlower(cardX+30, cardY+30, 6, '#e94f64', '#f4d35e');
+  drawFlower(cardX+cardW-30, cardY+30, 6, '#f4c534', '#c83030');
+  drawFlower(cardX+30, cardY+cardH-30, 6, '#1a5aa8', '#f4d35e');
+  drawFlower(cardX+cardW-30, cardY+cardH-30, 6, '#f4486c', '#fff4d6');
+
+  const q = FRIDA_QUESTIONS[game.qaIdx];
+  if (!q) return;
+
+  const tx = cardX + 230;
+  const tw = cardW - 260;
+
+  if (game.qaPhase === 'asking') {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#5a3010';
+    ctx.font = 'italic 16px Georgia';
+    wrapTextLeft(q.intro, tx, cardY+44, tw, 22);
+    ctx.font = 'bold 22px Georgia';
+    ctx.fillStyle = '#3a2010';
+    wrapTextLeft(`« ${q.question} »`, tx, cardY+100, tw, 28);
+    ctx.font = 'bold 14px Georgia';
+    ctx.fillStyle = '#7a1818';
+    ctx.fillText("Réponds avec 1, 2 ou 3 :", tx, cardY+180);
+
+    for (let i = 0; i < q.answers.length; i++) {
+      const ay = cardY + 210 + i*54;
+      ctx.fillStyle = ['#e94f64','#1a5aa8','#3a7a3a'][i];
+      ctx.fillRect(tx, ay, 36, 36);
+      ctx.fillStyle = '#f4e6c8';
+      ctx.font = 'bold 22px Georgia';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(i+1), tx+18, ay+18);
+      ctx.fillStyle = '#3a2010';
+      ctx.font = '16px Georgia';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      wrapTextLeft(q.answers[i].text, tx+50, ay+10, tw-60, 20);
+    }
+  } else {
+    // reply
+    const a = q.answers[game.qaAnswered];
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillStyle = a.correct ? '#3a7a3a' : '#7a1818';
+    ctx.font = 'bold 20px Georgia';
+    ctx.fillText(a.correct ? "Bonne réponse !  (+50 pts)" : "Pas tout à fait...", tx, cardY+44);
+    ctx.fillStyle = '#5a3010';
+    ctx.font = 'italic 18px Georgia';
+    wrapTextLeft(`Tu as choisi : « ${a.text} »`, tx, cardY+80, tw, 22);
+    ctx.fillStyle = '#3a2010';
+    ctx.font = '18px Georgia';
+    wrapTextLeft(`Frida : « ${a.reply} »`, tx, cardY+140, tw, 24);
+    ctx.font = 'bold 18px Georgia';
+    ctx.fillStyle = '#7a1818';
+    const blink = Math.sin(t*0.15) > 0;
+    if (blink) ctx.fillText("▶ ESPACE pour choisir ton pouvoir", tx, cardY+cardH-60);
+  }
+}
+
+function wrapTextLeft(text, x, y, maxW, lineH) {
+  const words = text.split(' ');
+  let line = '', yy = y;
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW) {
+      ctx.fillText(line, x, yy);
+      yy += lineH;
+      line = w;
+    } else line = test;
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+
+// ============================================================================
+//  POWER SELECT SCREEN — pick 1 of 3 powers for the upcoming level
+// ============================================================================
+function drawPowerSelect(t) {
+  drawLondonBG(t);
+  ctx.fillStyle = 'rgba(20, 10, 25, 0.78)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 36px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText('CHOISIS TON POUVOIR', W/2, 80);
+  ctx.font = 'italic 18px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  const nxt = LEVELS[game.qaIdx];
+  ctx.fillText(`Pour l'acte « ${nxt ? nxt.name : '???'} »`, W/2, 110);
+
+  // 3 cards
+  const cardW = 240, cardH = 280, gap = 30;
+  const totalW = 3*cardW + 2*gap;
+  const startX = (W - totalW) / 2;
+  const cardY = 160;
+  const choices = (game.powerChoicesForLevel && game.powerChoicesForLevel.length) ? game.powerChoicesForLevel : POWER_POOL.slice(0,3);
+  for (let i = 0; i < 3; i++) {
+    const p = choices[i];
+    const cx = startX + i*(cardW + gap);
+    // Card background
+    ctx.fillStyle = '#f4e6c8';
+    ctx.fillRect(cx, cardY, cardW, cardH);
+    ctx.strokeStyle = p.color; ctx.lineWidth = 4;
+    ctx.strokeRect(cx, cardY, cardW, cardH);
+    ctx.strokeStyle = '#3a2010'; ctx.lineWidth = 1;
+    ctx.strokeRect(cx+5, cardY+5, cardW-10, cardH-10);
+    // Number badge
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(cx+30, cardY+30, 18, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#f4e6c8';
+    ctx.font = 'bold 24px Georgia';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(String(i+1), cx+30, cardY+31);
+    // Power sprite (large)
+    ctx.save();
+    ctx.translate(cx + cardW/2, cardY + 110);
+    ctx.scale(3.5, 3.5);
+    const ic = p.icon || p.kind;
+    if (ic === 'ribbon') drawRibbon(0, 0, t);
+    else if (ic === 'shawl') drawShawl(0, 0, t);
+    else if (ic === 'crown') drawCrown(0, 0, t);
+    else if (ic === 'fire') drawFireIcon(0, 0, t);
+    else if (ic === 'wing') drawWingIcon(0, 0, t);
+    else if (ic === 'magnet') drawMagnetIcon(0, 0, t);
+    else if (ic === 'hourglass') drawHourglassIcon(0, 0, t);
+    else if (ic === 'skull') drawSkullIcon(0, 0, t);
+    else if (ic === 'boot') drawBootIcon(0, 0, t);
+    else if (ic === 'brush') drawPickupBrush(0, 0, t);
+    ctx.restore();
+    // Name
+    ctx.fillStyle = p.color;
+    ctx.font = 'bold 20px Georgia';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(p.name, cx + cardW/2, cardY + 200);
+    // Description
+    ctx.fillStyle = '#3a2010';
+    ctx.font = '14px Georgia';
+    wrapTextCenter(p.desc, cx + cardW/2, cardY + 230, cardW-20, 18);
+  }
+  ctx.font = 'bold 18px Georgia';
+  const blink = Math.sin(t*0.15) > 0;
+  ctx.fillStyle = blink ? '#f4e6c8' : '#c9a96e';
+  ctx.fillText('Appuie sur 1, 2 ou 3 pour choisir', W/2, H-30);
+}
+
+function wrapTextCenter(text, x, y, maxW, lineH) {
+  const words = text.split(' ');
+  let line = '', yy = y;
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW) {
+      ctx.fillText(line, x, yy);
+      yy += lineH;
+      line = w;
+    } else line = test;
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+
+// ----------------------------------------------------------------------------
+//  THEMED OBJECT SPRITES (lantern, gear, rose, brush)
+// ----------------------------------------------------------------------------
+function drawPickupLantern(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  const glow = (Math.sin(t*0.15)*0.5+0.5);
+  ctx.fillStyle = `rgba(255, 200, 80, ${0.25 + glow*0.2})`;
+  ctx.beginPath(); ctx.arc(0, 0, 14, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(-2, -10, 4, 3);
+  ctx.fillRect(-6, -8, 12, 2);
+  ctx.fillStyle = '#f4d35e';
+  ctx.beginPath();
+  ctx.moveTo(-5, -6); ctx.lineTo(5, -6); ctx.lineTo(6, 6); ctx.lineTo(-6, 6); ctx.closePath();
+  ctx.fill();
+  const flick = Math.sin(t*0.4)*1;
+  ctx.fillStyle = '#ffaa00';
+  ctx.beginPath();
+  ctx.moveTo(-2, 3); ctx.lineTo(0, -3+flick); ctx.lineTo(2, 3); ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#fff4d6';
+  ctx.fillRect(-1, 0, 2, 2);
+  ctx.fillStyle = '#1a1010';
+  ctx.fillRect(-5, 6, 10, 2);
+  ctx.restore();
+}
+
+function drawPickupGear(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(t*0.08);
+  ctx.fillStyle = '#9a3030';
+  const r = 8;
+  for (let i = 0; i < 8; i++) {
+    ctx.save(); ctx.rotate(i*Math.PI/4);
+    ctx.fillRect(-2, -r-3, 4, 6);
+    ctx.restore();
+  }
+  ctx.fillStyle = '#c84040';
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#7a1818';
+  ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#3a0808';
+  ctx.beginPath(); ctx.arc(0, 0, 1.5, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawPickupRose(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.strokeStyle = '#3a7a3a';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(0, 12); ctx.lineTo(0, -2); ctx.stroke();
+  ctx.fillStyle = '#3a7a3a';
+  ctx.beginPath();
+  ctx.ellipse(-4, 5, 4, 2, -0.4, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(4, 8, 3.5, 2, 0.4, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#f4f4f4';
+  ctx.beginPath(); ctx.arc(0, -4, 7, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#c82040';
+  for (let i = 0; i < 5; i++) {
+    const a = (i/5)*Math.PI*2;
+    ctx.beginPath();
+    ctx.ellipse(Math.cos(a)*3, -4 + Math.sin(a)*3, 3.5, 2.5, a, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#f4d35e';
+  ctx.beginPath(); ctx.arc(0, -4, 1.5, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawPickupBrush(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.sin(t*0.08)*0.2 - 0.4);
+  ctx.fillStyle = '#7a4a20';
+  ctx.fillRect(-1.5, -10, 3, 14);
+  ctx.fillStyle = '#5a3010';
+  ctx.fillRect(-1.5, 0, 3, 4);
+  ctx.fillStyle = '#c0c0c0';
+  ctx.fillRect(-3, 4, 6, 3);
+  ctx.fillStyle = '#c83030';
+  ctx.beginPath();
+  ctx.moveTo(-3, 7); ctx.lineTo(-4, 13); ctx.lineTo(0, 15); ctx.lineTo(4, 13); ctx.lineTo(3, 7);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#e94f64';
+  ctx.beginPath(); ctx.arc(0, 16, 2, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// ----------------------------------------------------------------------------
+//  DECOR TRIGGER — when a theme objective is met, the world transforms
+// ----------------------------------------------------------------------------
+function triggerDecor(kind) {
+  game.decorTriggered[kind] = true;
+  game.decorTransition = 0;
+  game.flashGold = 60;
+  game.shake = 12;
+  SFX.win();
+  spawnPetals(W/2 + game.camera.x, 200 + game.camera.y);
+  const msg = {
+    lantern: "TOUTES LES LANTERNES S'ALLUMENT !",
+    gear:    "L'USINE DEVIENT CAUCHEMAR MÉCANIQUE !",
+    rose:    "LA LANDE SE COUVRE DE FLEURS !",
+    brush:   "LE MONDE DEVIENT UN TABLEAU DE FRIDA !",
+  }[kind];
+  game.message = msg;
+  game.messageTimer = 180;
+  if (game.player) {
+    showFloatText(msg, game.player.x + game.player.w/2, game.player.y - 30, '#f4d35e', 16);
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  PERSISTENT NOTIFICATIONS PANEL — stays visible 6 seconds
+// ----------------------------------------------------------------------------
+const NOTIF_LIFE = 360;  // 6 seconds at 60 fps
+const NOTIF_MAX = 4;
+
+function pushNotif(notif) {
+  // notif: { iconKind, title, desc, color }
+  notif.life = NOTIF_LIFE;
+  notif.maxLife = NOTIF_LIFE;
+  if (!game.notifications) game.notifications = [];
+  game.notifications.unshift(notif);
+  if (game.notifications.length > NOTIF_MAX) game.notifications.length = NOTIF_MAX;
+}
+function updateNotifications() {
+  if (!game.notifications) return;
+  for (let i = game.notifications.length - 1; i >= 0; i--) {
+    game.notifications[i].life--;
+    if (game.notifications[i].life <= 0) game.notifications.splice(i, 1);
+  }
+}
+function drawNotifications() {
+  if (!game.notifications || game.notifications.length === 0) return;
+  const x = W - 280;
+  const baseY = H - 30;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  for (let i = 0; i < game.notifications.length; i++) {
+    const n = game.notifications[i];
+    const y = baseY - i*68;
+    const fade = Math.min(1, n.life / 30);
+    ctx.save();
+    ctx.globalAlpha = fade;
+    // Background card
+    ctx.fillStyle = 'rgba(20, 10, 25, 0.92)';
+    ctx.fillRect(x, y-28, 268, 56);
+    ctx.strokeStyle = n.color || '#c9a96e';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y-28, 268, 56);
+    // Icon (left)
+    ctx.save();
+    ctx.translate(x+24, y);
+    ctx.scale(1.2, 1.2);
+    if (n.iconKind === 'tea') drawTeacup(0, 0, game.time);
+    else if (n.iconKind === 'scone') drawScone(0, 0, game.time);
+    else if (n.iconKind === 'ribbon') drawRibbon(0, 0, game.time);
+    else if (n.iconKind === 'shawl') drawShawl(0, 0, game.time);
+    else if (n.iconKind === 'crown') drawCrown(0, 0, game.time);
+    else if (n.iconKind === 'lantern') drawPickupLantern(0, 0, game.time);
+    else if (n.iconKind === 'gear') drawPickupGear(0, 0, game.time);
+    else if (n.iconKind === 'rose') drawPickupRose(0, 0, game.time);
+    else if (n.iconKind === 'brush') drawPickupBrush(0, 0, game.time);
+    else if (n.iconKind === 'fire') drawFireIcon(0, 0, game.time);
+    else if (n.iconKind === 'wing') drawWingIcon(0, 0, game.time);
+    else if (n.iconKind === 'magnet') drawMagnetIcon(0, 0, game.time);
+    else if (n.iconKind === 'hourglass') drawHourglassIcon(0, 0, game.time);
+    else if (n.iconKind === 'skull') drawSkullIcon(0, 0, game.time);
+    else if (n.iconKind === 'boot') drawBootIcon(0, 0, game.time);
+    else if (n.iconKind === 'switch') drawSwitchIcon(0, 0, game.time);
+    ctx.restore();
+    // Title
+    ctx.font = 'bold 14px Georgia';
+    ctx.fillStyle = n.color || '#f4d35e';
+    ctx.fillText(n.title, x+50, y-8);
+    // Description
+    ctx.font = '11px Georgia';
+    ctx.fillStyle = '#f4e6c8';
+    ctx.fillText(n.desc, x+50, y+10);
+    // Life bar at the bottom of the card
+    ctx.fillStyle = '#332533';
+    ctx.fillRect(x, y+24, 268, 3);
+    ctx.fillStyle = n.color || '#c9a96e';
+    ctx.fillRect(x, y+24, 268 * (n.life / n.maxLife), 3);
+    ctx.restore();
+  }
+}
+
+// Simple icons used by notifications
+function drawFireIcon(x, y, t) {
+  ctx.save(); ctx.translate(x, y);
+  const flick = Math.sin(t*0.3)*1.5;
+  ctx.fillStyle = '#ff6622';
+  ctx.beginPath();
+  ctx.moveTo(-5, 8); ctx.quadraticCurveTo(-7, 0, -2, -3);
+  ctx.quadraticCurveTo(-1, 0, 1, -4 + flick);
+  ctx.quadraticCurveTo(3, -8, 6, -2);
+  ctx.quadraticCurveTo(8, 6, 0, 9);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#ffcc44';
+  ctx.beginPath(); ctx.arc(0, 4, 3, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawWingIcon(x, y, t) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = '#aaccff';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.quadraticCurveTo(-6, -8, -12, -4);
+  ctx.quadraticCurveTo(-6, 0, 0, 0);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.quadraticCurveTo(6, -8, 12, -4);
+  ctx.quadraticCurveTo(6, 0, 0, 0);
+  ctx.fill();
+  ctx.fillStyle = '#f4e6c8';
+  ctx.beginPath(); ctx.arc(0, 0, 2, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawMagnetIcon(x, y, t) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = '#cc44dd';
+  ctx.fillRect(-7, -8, 4, 14);
+  ctx.fillRect(3, -8, 4, 14);
+  ctx.fillRect(-7, -8, 14, 4);
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillRect(-7, 2, 4, 4);
+  ctx.fillRect(3, 2, 4, 4);
+  ctx.restore();
+}
+function drawHourglassIcon(x, y, t) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = '#88cc44';
+  ctx.beginPath();
+  ctx.moveTo(-7, -8); ctx.lineTo(7, -8); ctx.lineTo(0, 0); ctx.lineTo(7, 8); ctx.lineTo(-7, 8); ctx.lineTo(0, 0); ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#3a2010';
+  ctx.fillRect(-8, -10, 16, 2);
+  ctx.fillRect(-8, 8, 16, 2);
+  ctx.restore();
+}
+function drawSkullIcon(x, y, t) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = '#fff4d6';
+  ctx.beginPath(); ctx.arc(0, -2, 8, 0, Math.PI*2); ctx.fill();
+  ctx.fillRect(-5, 4, 10, 5);
+  ctx.fillStyle = '#1a0a0a';
+  ctx.beginPath(); ctx.arc(-3, -2, 2, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(3, -2, 2, 0, Math.PI*2); ctx.fill();
+  ctx.fillRect(-1, 3, 2, 3);
+  ctx.restore();
+}
+function drawBootIcon(x, y, t) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(-4, -8, 6, 12);
+  ctx.fillRect(-7, 4, 12, 5);
+  ctx.fillStyle = '#7a4a20';
+  ctx.fillRect(-7, 8, 12, 2);
+  ctx.restore();
+}
+function drawSwitchIcon(x, y, t) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = '#3a2010';
+  ctx.fillRect(-6, 2, 12, 6);
+  ctx.fillStyle = '#c0c0c0';
+  ctx.fillRect(-1, -8, 2, 10);
+  ctx.beginPath(); ctx.arc(0, -8, 3, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// ----------------------------------------------------------------------------
+//  FLOAT TEXT (small text that rises and fades)
+// ----------------------------------------------------------------------------
+function showFloatText(txt, x, y, color='#f4e6c8', size=14) {
+  game.floatTexts.push({ txt, x, y, vy: -1.2, life: 60, maxLife: 60, color, size });
+}
+function updateFloatTexts() {
+  for (let i = game.floatTexts.length - 1; i >= 0; i--) {
+    const t = game.floatTexts[i];
+    t.y += t.vy; t.vy *= 0.96; t.life--;
+    if (t.life <= 0) game.floatTexts.splice(i, 1);
+  }
+}
+function drawFloatTexts() {
+  for (const t of game.floatTexts) {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, t.life / 30);
+    ctx.font = `bold ${t.size}px Georgia`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.strokeText(t.txt, t.x, t.y);
+    ctx.fillStyle = t.color;
+    ctx.fillText(t.txt, t.x, t.y);
+    ctx.restore();
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  ENEMY CHATTER (speech bubbles)
+// ----------------------------------------------------------------------------
+function maybeChatter(e) {
+  // Each enemy randomly says something occasionally
+  if (Math.random() < 0.003) {
+    const lines = {
+      bobby:   ["Halte-là !", "Eh, vous !", "Au nom de la Reine !", "Saperlipopette !", "Stop, je vous dis !"],
+      sweep:   ["Du charbon !", "Pousse-toi, p'tite !", "Eh, la dame !", "Tousse tousse..."],
+      topboss: ["Mes profits !", "Plus de vapeur !", "Le loyer, le loyer !", "Bah, des artistes...", "Au travail !"],
+      smog:    ["Tousse, tousse !", "*pollue royalement*", "Hum hum...", "Mort aux poumons !"],
+      dog:     ["Wouaf !", "Grrr...", "Aboie ! Aboie !", "Wraf wraf !"],
+      sheep:   ["Bêêê...", "Mééé.", "Bê.", "...zzz..."],
+      guard:   ["Pour la Couronne !", "Silence, étrangère !", "...", "On ne passe pas."],
+      queen:   ["Nous ne sommes pas amusée.", "Qu'on lui ôte sa perruque !", "Nous sommes la Reine !", "Vil insecte mexicain !"],
+    };
+    const arr = lines[e.type];
+    if (!arr) return;
+    const line = arr[Math.floor(Math.random()*arr.length)];
+    e.chatter = { text: line, life: 100 };
+  }
+  if (e.chatter) { e.chatter.life--; if (e.chatter.life <= 0) e.chatter = null; }
+}
+
+// ----------------------------------------------------------------------------
+//  PLAYER (Frida Kahlo)
+// ----------------------------------------------------------------------------
+function makePlayer(spawn) {
+  return {
+    x: spawn.x * TILE,
+    y: spawn.y * TILE,
+    w: 22, h: 30,
+    vx: 0, vy: 0,
+    onGround: false,
+    facing: 1,
+    walkPhase: 0,
+    jumpHeld: false,
+    coyote: 0,
+    jumpBuffer: 0,
+    invuln: 0,
+    hurtFlash: 0,
+    deadTimer: 0,
+    dead: false,
+    won: false,
+    // Power-up state (timers in frames; 0 = inactive)
+    powerDoubleJump: 0,
+    doubleJumpUsed: false,
+    // Wall + dash mobility (always on)
+    wallSliding: false,
+    wallSide: 0,        // -1 if wall is on left, +1 if on right
+    dashCD: 0,
+    dashing: 0,
+    dashedInAir: false,
+    dashSign: 1,
+    powerSprint: 0,
+    powerInvinc: 0,
+    powerFireball: 0,
+    fireballCD: 0,
+    powerFly: 0,
+    powerMagnet: 0,
+    powerSlowmo: 0,
+    powerScoreBoost: 0,
+    powerGroundpound: 0,
+    powerBrush: 0,
+    brushPlatesLeft: 0,
+    hairFlow: 0,
+  };
+}
+
+// Physics - tuned via interactive lab. "Slow & floaty" profile.
+const GRAVITY = 0.30;
+const MOVE_ACCEL = 0.10;
+const AIR_ACCEL = 0.05;
+const MOVE_MAX_BASE = 2.0;
+const MOVE_MAX_SPRINT = 3.5;       // sprint power-up scales accordingly
+const FRICTION_GROUND = 0.85;
+const FRICTION_AIR = 0.97;
+const TURN_AROUND_MULT = 2.0;      // multiplier on accel when reversing direction
+const JUMP_V = -6.0;
+const JUMP_CUT = 0.30;
+const GRAVITY_UP_MULT = 0.46;      // gravity multiplier while ascending (jump held)
+const GRAVITY_DOWN_MULT = 1.50;    // gravity multiplier while falling
+const HANGTIME_THRESHOLD = 3.0;
+const HANGTIME_FACTOR = 0.25;
+const COYOTE_FRAMES = 7;
+const JUMP_BUFFER_FRAMES = 8;
+const MAX_FALL = 13.5;
+// Power-up tuning
+const DOUBLE_JUMP_V = -5.5;
+// Optional movement: wall, dash, corner correction
+const WALL_SLIDE_SPEED = 0.80;
+const WALL_JUMP_VY = -6.0;
+const WALL_JUMP_VX = 2.0;          // push away from wall horizontally
+const DASH_SPEED = 5.0;
+const DASH_DUR = 20;
+const DASH_CD = 120;
+const CORNER_CORRECT_PX = 8;       // max pixel forgiveness for head-bumps
+// Theoretical max jump: ~135 px vertical (4.2 tiles), ~210 px horizontal (6.5 tiles)
+// Practical (with accel ramp): ~3.8 tiles up, ~5 tiles across — used by the level solver.
+
+// ----------------------------------------------------------------------------
+//  ENEMY FACTORY
+// ----------------------------------------------------------------------------
+function makeEnemy(spec) {
+  const e = {
+    type: spec.type,
+    x: spec.x * TILE,
+    y: spec.y * TILE,
+    vx: 0, vy: 0,
+    w: 26, h: 28,
+    onGround: false,
+    facing: -1,
+    phase: Math.random() * Math.PI * 2,
+    alive: true,
+    deathTimer: 0,
+    hp: 1,
+  };
+  switch (spec.type) {
+    case 'bobby':   e.speed = 1.0; break;
+    case 'sweep':   e.speed = 1.6; e.h = 26; break;
+    case 'topboss': e.speed = 0.7; e.w = 30; e.h = 32; break;
+    case 'smog':    e.speed = 0; e.w = 36; e.h = 28; e.flies = true; e.baseY = e.y; break;
+    case 'dog':     e.speed = 1.8; e.w = 30; e.h = 22; break;
+    case 'sheep':   e.speed = 0.5; e.w = 30; e.h = 24; break;
+    case 'guard':   e.speed = 1.1; e.w = 22; e.h = 34; break;
+    case 'queen':   e.speed = 0.6; e.w = 38; e.h = 44; e.hp = 3; e.isBoss = true; break;
+  }
+  return e;
+}
+
+// ----------------------------------------------------------------------------
+//  PICKUPS (coins and scones)
+// ----------------------------------------------------------------------------
+function buildPickups(level) {
+  const out = [];
+  for (let y=0; y<level.h; y++) {
+    for (let x=0; x<level.w; x++) {
+      const c = level.grid[y][x];
+      if (c === 'o') {
+        out.push({ kind:'tea', x:x*TILE+8, y:y*TILE+8, w:16, h:16, taken:false, phase: Math.random()*6 });
+        level.grid[y][x] = '.';
+      } else if (c === 'S') {
+        out.push({ kind:'scone', x:x*TILE+4, y:y*TILE+4, w:24, h:24, taken:false, phase: Math.random()*6 });
+        level.grid[y][x] = '.';
+      } else if (c === 'R') {
+        out.push({ kind:'ribbon', x:x*TILE+4, y:y*TILE+4, w:24, h:24, taken:false, phase: Math.random()*6 });
+        level.grid[y][x] = '.';
+      } else if (c === 'C') {
+        out.push({ kind:'shawl', x:x*TILE+4, y:y*TILE+4, w:24, h:24, taken:false, phase: Math.random()*6 });
+        level.grid[y][x] = '.';
+      } else if (c === 'K') {
+        out.push({ kind:'crown', x:x*TILE+4, y:y*TILE+4, w:24, h:24, taken:false, phase: Math.random()*6 });
+        level.grid[y][x] = '.';
+      }
+    }
+  }
+  // Pre-defined power-up spawns
+  if (level.powerups) {
+    for (const pu of level.powerups) {
+      out.push({ kind: pu.kind, x: pu.x*TILE+4, y: pu.y*TILE+4, w:24, h:24, taken:false, phase: Math.random()*6 });
+    }
+  }
+  // Pre-defined themed extras (lantern / gear / rose / brush)
+  if (level.extras) {
+    for (const ex of level.extras) {
+      out.push({ kind: ex.kind, x: ex.x*TILE+4, y: ex.y*TILE+4, w:24, h:24, taken:false, phase: Math.random()*6 });
+    }
+  }
+  return out;
+}
+
+// Power-up activation durations (frames @ 60fps)
+const POWER_DURATIONS = {
+  ribbon: 60 * 14,   // 14s of double jump
+  shawl:  60 * 10,   // 10s of sprint
+  crown:  60 * 7,    // 7s of invincibility
+};
+
+// ----------------------------------------------------------------------------
+//  COLLISION HELPERS
+// ----------------------------------------------------------------------------
+const SOLIDS = new Set(['#','=','|','-','?','T','B']);
+const HAZARDS = new Set(['^','G','~']);
+
+function tileAt(level, tx, ty) {
+  if (ty < 0 || ty >= level.h || tx < 0 || tx >= level.w) return '.';
+  return level.grid[ty][tx];
+}
+function isSolid(c) { return SOLIDS.has(c); }
+function isHazard(c) { return HAZARDS.has(c); }
+
+// BB offset (constant): bb.x = ent.x + BBX, bb.w = ent.w - 2*BBX
+const BBX = 3;
+
+function entBB(ent) {
+  return {
+    x: ent.x + BBX,
+    y: ent.y,
+    w: ent.w - 2*BBX,
+    h: ent.h,
+  };
+}
+
+// Check if there's a solid wall immediately to the side of the player (dir = +1 right, -1 left)
+function checkWallSide(p, dir, level) {
+  const bbx = p.x + BBX, bbw = p.w - 2*BBX;
+  const tx = dir > 0 ? Math.floor((bbx + bbw + 1) / TILE) : Math.floor((bbx - 1) / TILE);
+  const y1 = Math.floor(p.y / TILE);
+  const y2 = Math.floor((p.y + p.h - 1) / TILE);
+  for (let ty = y1; ty <= y2; ty++) {
+    if (isSolid(tileAt(level, tx, ty))) return true;
+  }
+  return false;
+}
+
+function moveAndCollide(ent, level) {
+  // ---- X axis ----
+  ent.x += ent.vx;
+  let bbX = ent.x + BBX;
+  let bbW = ent.w - 2*BBX;
+  let bbY = ent.y;
+  let bbH = ent.h;
+  if (ent.vx > 0) {
+    const tx = Math.floor((bbX + bbW) / TILE);
+    const y1 = Math.floor(bbY / TILE);
+    const y2 = Math.floor((bbY + bbH - 1) / TILE);
+    for (let ty = y1; ty <= y2; ty++) {
+      if (isSolid(tileAt(level, tx, ty))) {
+        // snap so that bbX + bbW = tx*TILE
+        ent.x = tx*TILE - bbW - BBX;
+        ent.vx = 0;
+        ent.bumpedRight = true;
+        break;
+      }
+    }
+  } else if (ent.vx < 0) {
+    const tx = Math.floor(bbX / TILE);
+    const y1 = Math.floor(bbY / TILE);
+    const y2 = Math.floor((bbY + bbH - 1) / TILE);
+    for (let ty = y1; ty <= y2; ty++) {
+      if (isSolid(tileAt(level, tx, ty))) {
+        // snap so that bbX = (tx+1)*TILE
+        ent.x = (tx+1)*TILE - BBX;
+        ent.vx = 0;
+        ent.bumpedLeft = true;
+        break;
+      }
+    }
+  }
+
+  // ---- Y axis ----
+  ent.y += ent.vy;
+  ent.onGround = false;
+  bbX = ent.x + BBX;
+  bbW = ent.w - 2*BBX;
+  bbY = ent.y;
+  bbH = ent.h;
+  if (ent.vy > 0) {
+    const ty = Math.floor((bbY + bbH) / TILE);
+    const x1 = Math.floor(bbX / TILE);
+    const x2 = Math.floor((bbX + bbW - 1) / TILE);
+    for (let tx = x1; tx <= x2; tx++) {
+      if (isSolid(tileAt(level, tx, ty))) {
+        ent.y = ty*TILE - bbH;
+        ent.vy = 0;
+        ent.onGround = true;
+        break;
+      }
+    }
+  } else if (ent.vy < 0) {
+    const ty = Math.floor(bbY / TILE);
+    const x1 = Math.floor(bbX / TILE);
+    const x2 = Math.floor((bbX + bbW - 1) / TILE);
+    // CORNER CORRECTION : when only one of the two head tiles is solid AND we're close
+    // to its edge, nudge horizontally so the player slides past instead of bonking.
+    if (ent === game.player && x1 !== x2) {
+      const leftSolid = isSolid(tileAt(level, x1, ty));
+      const rightSolid = isSolid(tileAt(level, x2, ty));
+      if (leftSolid && !rightSolid) {
+        const overlap = (x1+1)*TILE - bbX;       // how much of player is in left tile
+        if (overlap <= CORNER_CORRECT_PX) {
+          ent.x += overlap;                       // nudge right to clear the corner
+          ent.y -= ent.vy;                        // undo y step, let next frame re-process
+          ent.vy *= 0.5;
+          return;
+        }
+      } else if (!leftSolid && rightSolid) {
+        const overlap = (bbX + bbW) - x2*TILE;
+        if (overlap <= CORNER_CORRECT_PX) {
+          ent.x -= overlap;
+          ent.y -= ent.vy;
+          ent.vy *= 0.5;
+          return;
+        }
+      }
+    }
+    for (let tx = x1; tx <= x2; tx++) {
+      const c = tileAt(level, tx, ty);
+      if (isSolid(c)) {
+        ent.y = (ty+1)*TILE;
+        ent.vy = 0;
+        if (c === '?' && ent === game.player) {
+          level.grid[ty][tx] = '=';
+          spawnCoinBurst((tx+0.5)*TILE, ty*TILE);
+          game.score += 50;
+          SFX.coin();
+        }
+        break;
+      }
+    }
+  }
+}
+
+function rectOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Hazards: check if entity overlaps a hazard tile
+function checkHazards(ent, level) {
+  const bb = entBB(ent);
+  const x1 = Math.floor(bb.x / TILE);
+  const x2 = Math.floor((bb.x + bb.w - 1) / TILE);
+  const y1 = Math.floor(bb.y / TILE);
+  const y2 = Math.floor((bb.y + bb.h - 1) / TILE);
+  for (let ty = y1; ty <= y2; ty++) {
+    for (let tx = x1; tx <= x2; tx++) {
+      if (isHazard(tileAt(level, tx, ty))) return true;
+    }
+  }
+  return false;
+}
+
+// ----------------------------------------------------------------------------
+//  PARTICLES
+// ----------------------------------------------------------------------------
+function spawnCoinBurst(x, y) {
+  for (let i=0; i<8; i++) {
+    game.particles.push({
+      x, y,
+      vx: (Math.random()-0.5)*4,
+      vy: -Math.random()*4-2,
+      g: 0.2, life: 30, color:'#f4d35e', size: 3+Math.random()*2,
+    });
+  }
+}
+function spawnPuff(x, y, color='#cccccc') {
+  for (let i=0; i<6; i++) {
+    game.particles.push({
+      x, y,
+      vx: (Math.random()-0.5)*2,
+      vy: -Math.random()*2-0.5,
+      g: 0.02, life: 40, color, size: 4+Math.random()*3,
+    });
+  }
+}
+function spawnPetals(x, y) {
+  const colors = ['#e94f64','#f4a4b9','#f7c948','#f6e7d2'];
+  for (let i=0; i<14; i++) {
+    game.particles.push({
+      x, y,
+      vx: (Math.random()-0.5)*5,
+      vy: -Math.random()*5-2,
+      g: 0.15, life: 60, color: colors[Math.floor(Math.random()*colors.length)],
+      size: 3+Math.random()*3, rot: Math.random()*Math.PI, vr: (Math.random()-0.5)*0.3,
+    });
+  }
+}
+
+function updateParticles() {
+  for (let i = game.particles.length - 1; i >= 0; i--) {
+    const p = game.particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += p.g;
+    if (p.rot !== undefined) p.rot += p.vr;
+    p.life--;
+    if (p.life <= 0) game.particles.splice(i, 1);
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  ENEMY UPDATE
+// ----------------------------------------------------------------------------
+function updateEnemy(e, level) {
+  if (!e.alive) {
+    e.deathTimer++;
+    e.y += 4;
+    e.vx *= 0.95;
+    return;
+  }
+  e.phase += 0.1;
+
+  if (e.flies) {
+    // smog cloud - drifts in a sine
+    e.x += Math.sin(e.phase * 0.3) * 0.7;
+    e.y = e.baseY + Math.sin(e.phase * 0.5) * 12;
+    return;
+  }
+
+  if (e.isBoss) {
+    // queen - paces and occasionally hops
+    e.vx = e.facing * e.speed;
+    e.vy += GRAVITY;
+    moveAndCollide(e, level);
+    if (e.bumpedLeft || e.bumpedRight) e.facing *= -1;
+    e.bumpedLeft = e.bumpedRight = false;
+    // edge detection
+    const aheadX = e.x + (e.facing > 0 ? e.w + 2 : -2);
+    const belowTile = tileAt(level, Math.floor(aheadX/TILE), Math.floor((e.y+e.h+2)/TILE));
+    if (!isSolid(belowTile) && e.onGround) e.facing *= -1;
+    // jump occasionally
+    if (e.onGround && Math.random() < 0.012) {
+      e.vy = -8;
+      spawnPuff(e.x+e.w/2, e.y+e.h);
+    }
+    return;
+  }
+
+  e.vx = e.facing * e.speed;
+  e.vy += GRAVITY;
+  moveAndCollide(e, level);
+  if (e.bumpedLeft || e.bumpedRight) e.facing *= -1;
+  e.bumpedLeft = e.bumpedRight = false;
+  // turn around at edge
+  if (e.onGround) {
+    const aheadX = e.x + (e.facing > 0 ? e.w + 2 : -2);
+    const belowTile = tileAt(level, Math.floor(aheadX/TILE), Math.floor((e.y+e.h+2)/TILE));
+    if (!isSolid(belowTile)) e.facing *= -1;
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  PLAYER UPDATE
+// ----------------------------------------------------------------------------
+function updatePlayer() {
+  const p = game.player;
+  if (p.won) {
+    // walk-off animation
+    p.vx = 1.5;
+    p.vy += GRAVITY;
+    moveAndCollide(p, game.level);
+    p.walkPhase += 0.3;
+    return;
+  }
+  if (p.dead) {
+    p.deadTimer++;
+    p.y += p.vy;
+    p.vy += 0.5;
+    return;
+  }
+
+  // ----- Power-up timers -----
+  if (p.powerDoubleJump > 0) p.powerDoubleJump--;
+  if (p.powerSprint > 0)     p.powerSprint--;
+  if (p.powerInvinc > 0)     p.powerInvinc--;
+  if (p.powerFireball > 0)   p.powerFireball--;
+  if (p.powerFly > 0)        p.powerFly--;
+  if (p.powerMagnet > 0)     p.powerMagnet--;
+  if (p.powerSlowmo > 0)     p.powerSlowmo--;
+  if (p.powerScoreBoost > 0) p.powerScoreBoost--;
+  if (p.powerGroundpound > 0) p.powerGroundpound--;
+  if (p.powerBrush > 0)      p.powerBrush--;
+  if (p.fireballCD > 0)      p.fireballCD--;
+  p.hairFlow += 0.15;
+
+  // ----- FIREBALL: press F to shoot -----
+  if (p.powerFireball > 0 && p.fireballCD <= 0 && consume('KeyF')) {
+    game.projectiles = game.projectiles || [];
+    game.projectiles.push({
+      x: p.x + p.w/2, y: p.y + 6,
+      vx: 7 * p.facing, vy: -1.5,
+      life: 90, kind: 'fire',
+    });
+    p.fireballCD = 24;
+    SFX.jump();
+  }
+
+  // ----- BRUSH PLATFORM: press F to paint -----
+  if (p.powerBrush > 0 && p.brushPlatesLeft > 0 && consume('KeyF')) {
+    const tx = Math.floor((p.x + p.w/2) / TILE);
+    const ty = Math.floor((p.y + p.h + 6) / TILE);
+    if (ty >= 0 && ty < game.level.h) {
+      // Paint a 3-wide platform
+      for (let dx = -1; dx <= 1; dx++) {
+        const cx = tx + dx;
+        if (cx >= 0 && cx < game.level.w && game.level.grid[ty][cx] === '.') {
+          game.level.grid[ty][cx] = '=';
+        }
+      }
+      p.brushPlatesLeft--;
+      SFX.coin();
+      pushNotif({ iconKind:'brush', title:'PLATEFORME PEINTE', desc:`Encore ${p.brushPlatesLeft} plateforme(s) à peindre`, color:'#dd2244' });
+    }
+  }
+
+  // ----- MAGNET: attract tea pickups in radius -----
+  if (p.powerMagnet > 0) {
+    const cx = p.x + p.w/2, cy = p.y + p.h/2;
+    for (const k of game.pickups) {
+      if (k.taken || k.kind !== 'tea') continue;
+      const dx = cx - (k.x + k.w/2), dy = cy - (k.y + k.h/2);
+      const d = Math.hypot(dx, dy);
+      if (d < 120 && d > 0) {
+        k.x += (dx / d) * 4;
+        k.y += (dy / d) * 4;
+      }
+    }
+  }
+
+  // ----- GROUNDPOUND: press DOWN in air to slam -----
+  if (p.powerGroundpound > 0 && !p.onGround && p.vy > -2) {
+    if (pressing('ArrowDown','KeyS')) {
+      p.vy = 18;
+      p.groundPounding = true;
+    }
+  }
+  // Detect landing impact
+  if (p.groundPounding && p.onGround) {
+    // Kill enemies in radius
+    const cx = p.x + p.w/2, cy = p.y + p.h/2;
+    for (const e of game.enemies) {
+      if (!e.alive) continue;
+      const dx = (e.x+e.w/2) - cx, dy = (e.y+e.h/2) - cy;
+      if (Math.hypot(dx, dy) < 80) {
+        if (!e.isBoss) { e.alive = false; game.score += 100; spawnPuff(e.x+e.w/2, e.y+e.h/2, '#666666'); }
+        else { e.hp--; if (e.hp <= 0) { e.alive = false; game.bossKilled = true; game.score += 1000; SFX.win(); spawnPetals(e.x+e.w/2, e.y+e.h/2); }
+               else spawnPuff(e.x+e.w/2, e.y, '#ffd6e0'); }
+      }
+    }
+    game.shake = 12;
+    SFX.stomp();
+    for (let i=0; i<14; i++) {
+      game.particles.push({ x: cx, y: p.y+p.h, vx:(Math.random()-0.5)*7, vy:-Math.random()*3-1, g:0.15, life:30, color:'#888888', size:3+Math.random()*3 });
+    }
+    p.groundPounding = false;
+  }
+
+  // ----- DASH (Shift) -----
+  if (p.dashCD > 0) p.dashCD--;
+  if (p.onGround) p.dashedInAir = false;
+  if (p.dashing > 0) p.dashing--;
+  if (p.dashing <= 0 && (consume('ShiftLeft') || consume('ShiftRight')) && p.dashCD <= 0 && !p.dashedInAir) {
+    const dir = pressing('ArrowRight','KeyD') ? 1 : (pressing('ArrowLeft','KeyA','KeyQ') ? -1 : p.facing);
+    p.dashing = DASH_DUR;
+    p.dashSign = dir;
+    p.dashCD = DASH_CD;
+    if (!p.onGround) p.dashedInAir = true;
+    spawnPuff(p.x+p.w/2, p.y+p.h/2, '#fff4d6');
+    SFX.jump();
+  }
+
+  // ----- WALL SLIDE detection -----
+  p.wallSliding = false;
+  if (!p.onGround && p.vy > -1 && p.dashing <= 0) {
+    const rightHeld = pressing('ArrowRight','KeyD');
+    const leftHeld = pressing('ArrowLeft','KeyA','KeyQ');
+    if (rightHeld && checkWallSide(p, 1, game.level)) { p.wallSliding = true; p.wallSide = 1; }
+    else if (leftHeld && checkWallSide(p, -1, game.level)) { p.wallSliding = true; p.wallSide = -1; }
+  }
+
+  // ----- Horizontal input (progressive acceleration) -----
+  const left  = pressing('ArrowLeft','KeyA','KeyQ');
+  const right = pressing('ArrowRight','KeyD');
+  const moveMax = (p.powerSprint > 0) ? MOVE_MAX_SPRINT : MOVE_MAX_BASE;
+  const accel = p.onGround ? MOVE_ACCEL : AIR_ACCEL;
+  const fric  = p.onGround ? FRICTION_GROUND : FRICTION_AIR;
+
+  if (left && !right) {
+    if (p.vx > 0) p.vx -= accel * TURN_AROUND_MULT;
+    else          p.vx -= accel;
+    p.facing = -1;
+  } else if (right && !left) {
+    if (p.vx < 0) p.vx += accel * TURN_AROUND_MULT;
+    else          p.vx += accel;
+    p.facing = 1;
+  } else {
+    p.vx *= fric;
+    if (Math.abs(p.vx) < 0.12) p.vx = 0;
+  }
+  p.vx = Math.max(-moveMax, Math.min(moveMax, p.vx));
+
+  // ----- Coyote time -----
+  if (p.onGround) {
+    p.coyote = COYOTE_FRAMES;
+    p.doubleJumpUsed = false;       // landing resets double jump
+  } else if (p.coyote > 0) p.coyote--;
+
+  // ----- Jump buffer -----
+  if (consume('Space') || consume('ArrowUp') || consume('KeyW') || consume('KeyZ')) {
+    p.jumpBuffer = JUMP_BUFFER_FRAMES;
+  }
+  if (p.jumpBuffer > 0) p.jumpBuffer--;
+
+  // ----- Fire ground/coyote jump -----
+  if (p.jumpBuffer > 0 && (p.onGround || p.coyote > 0)) {
+    p.vy = JUMP_V;
+    p.onGround = false;
+    p.coyote = 0;
+    p.jumpBuffer = 0;
+    p.jumpHeld = true;
+    SFX.jump();
+    spawnPuff(p.x+p.w/2, p.y+p.h, '#dddddd');
+  }
+  // ----- WALL JUMP (when sliding) -----
+  else if (p.jumpBuffer > 0 && p.wallSliding) {
+    p.vy = WALL_JUMP_VY;
+    p.vx = -p.wallSide * WALL_JUMP_VX;
+    p.facing = -p.wallSide;
+    p.jumpBuffer = 0;
+    p.jumpHeld = true;
+    p.wallSliding = false;
+    SFX.jump();
+    spawnPuff(p.x+p.w/2 + p.wallSide*8, p.y+p.h/2, '#88ccff');
+  }
+  // ----- Double jump (only with Ruban Rouge power-up active) -----
+  else if (p.jumpBuffer > 0 && p.powerDoubleJump > 0 && !p.doubleJumpUsed && !p.onGround && p.coyote === 0) {
+    p.vy = DOUBLE_JUMP_V;
+    p.jumpBuffer = 0;
+    p.jumpHeld = true;
+    p.doubleJumpUsed = true;
+    SFX.jump();
+    // red ribbon swirl
+    for (let i = 0; i < 10; i++) {
+      game.particles.push({
+        x: p.x+p.w/2, y: p.y+p.h,
+        vx: Math.cos(i*Math.PI*2/10)*3, vy: Math.sin(i*Math.PI*2/10)*3 - 1,
+        g: 0.05, life: 30, color: '#e94f64', size: 3,
+      });
+    }
+  }
+
+  // ----- Variable jump cut -----
+  const jumpPress = pressing('Space','ArrowUp','KeyW','KeyZ');
+  if (!jumpPress && p.vy < 0 && p.jumpHeld) {
+    p.vy *= JUMP_CUT;
+    p.jumpHeld = false;
+  }
+
+  // ----- Gravity with HANGTIME at apex, plus FLY override -----
+  const jumpPressNow = pressing('Space','ArrowUp','KeyW','KeyZ');
+  let gravThisFrame = GRAVITY;
+  if (p.powerFly > 0 && !p.onGround && jumpPressNow) {
+    gravThisFrame = GRAVITY * 0.12;            // GLIDE
+    if (p.vy > 1.2) p.vy = 1.2;                // cap descent while gliding
+  } else if (Math.abs(p.vy) < HANGTIME_THRESHOLD && !p.onGround) {
+    gravThisFrame = GRAVITY * HANGTIME_FACTOR;
+  } else if (p.vy < 0 && p.jumpHeld) {
+    gravThisFrame = GRAVITY * GRAVITY_UP_MULT;
+  } else if (p.vy > 0) {
+    gravThisFrame = GRAVITY * GRAVITY_DOWN_MULT;
+  }
+  p.vy += gravThisFrame;
+  if (p.vy > MAX_FALL) p.vy = MAX_FALL;
+
+  // Wall slide caps fall speed
+  if (p.wallSliding && p.vy > WALL_SLIDE_SPEED) p.vy = WALL_SLIDE_SPEED;
+
+  // Dash overrides velocity (constant horizontal, no fall)
+  if (p.dashing > 0) {
+    p.vx = p.dashSign * DASH_SPEED;
+    p.vy = 0;
+  }
+
+  moveAndCollide(p, game.level);
+
+  // walk phase
+  if (Math.abs(p.vx) > 0.4 && p.onGround) {
+    p.walkPhase += Math.abs(p.vx) * 0.07;
+  } else if (!p.onGround) {
+    p.walkPhase = 0;
+  }
+
+  // Fell off?
+  if (p.y > game.level.pixelH + 200) {
+    killPlayer();
+  }
+
+  // Hazards (skipped while invincible)
+  if (p.invuln <= 0 && p.powerInvinc <= 0 && checkHazards(p, game.level)) {
+    killPlayer();
+  }
+
+  // Pickups
+  for (const k of game.pickups) {
+    if (k.taken) continue;
+    k.phase += 0.1;
+    if (rectOverlap(entBB(p), k)) {
+      k.taken = true;
+      if (k.kind === 'tea') {
+        const teaScore = (p.powerScoreBoost > 0) ? 30 : 10;
+        game.score += teaScore;
+        game.totalCoins++;
+        SFX.coin();
+        // Every 10 teas = bonus life, every 25 = power-up gift
+        if (game.totalCoins % 10 === 0) {
+          game.lives++;
+          game.flashGold = 30;
+          showFloatText("+1 VIE ! Quelle tasse !", p.x+p.w/2, p.y, '#f4d35e');
+        } else if (game.totalCoins % 5 === 0) {
+          showFloatText(["Splendide !","Magnifique !","¡Salud !","Quelle classe !"][Math.floor(Math.random()*4)], p.x+p.w/2, p.y-10, '#f4e6c8');
+        }
+        if (game.totalCoins % 25 === 0) {
+          // gift a random power-up at player position
+          const kinds = ['ribbon','shawl','crown'];
+          const kk = kinds[Math.floor(Math.random()*kinds.length)];
+          game.pickups.push({ kind: kk, x: p.x+p.w/2-12, y: p.y-30, w:24, h:24, taken:false, phase:0, gift:true });
+          showFloatText("CADEAU ROYAL !", p.x+p.w/2, p.y-22, '#e94f64');
+        }
+      }
+      else if (k.kind === 'scone') {
+        game.lives++; game.score += 100; SFX.coin(); game.flashGold = 30;
+        showFloatText("Scone à la crème !", p.x+p.w/2, p.y, '#f4d35e');
+      }
+      else if (k.kind === 'lantern' || k.kind === 'gear' || k.kind === 'rose' || k.kind === 'brush') {
+        const cnt = ++game.collected[k.kind];
+        const obj = OBJECTIVES[k.kind];
+        game.score += 30; SFX.coin();
+        spawnCoinBurst(k.x+k.w/2, k.y+k.h/2);
+        const labels = { lantern:'Lanterne', gear:'Engrenage', rose:'Rose', brush:'Pinceau' };
+        const colors = { lantern:'#ffcc44', gear:'#c84040', rose:'#e94f64', brush:'#f4486c' };
+        pushNotif({ iconKind:k.kind, title:`${labels[k.kind].toUpperCase()} ${cnt}/${obj}`,
+                    desc: cnt < obj ? `Encore ${obj-cnt} pour transformer le décor !` : 'Objectif atteint — observe le décor !',
+                    color: colors[k.kind] });
+        if (cnt >= obj && !game.decorTriggered[k.kind]) triggerDecor(k.kind);
+      }
+      else if (k.kind === 'ribbon') {
+        p.powerDoubleJump = POWER_DURATIONS.ribbon;
+        p.doubleJumpUsed = false;
+        game.score += 200; SFX.win();
+        spawnPetals(k.x+k.w/2, k.y+k.h/2);
+        pushNotif({ iconKind:'ribbon', title:'RUBAN ROUGE OBTENU', desc:'Double saut activé (≈ 14s) — réappuie SAUT en l\'air', color:'#e94f64' });
+      }
+      else if (k.kind === 'shawl') {
+        p.powerSprint = POWER_DURATIONS.shawl;
+        game.score += 200; SFX.win();
+        spawnPetals(k.x+k.w/2, k.y+k.h/2);
+        pushNotif({ iconKind:'shawl', title:'CHÂLE TEHUANA OBTENU', desc:'Sprint activé — vitesse de course augmentée', color:'#1a5aa8' });
+      }
+      else if (k.kind === 'crown') {
+        p.powerInvinc = POWER_DURATIONS.crown;
+        game.score += 200; SFX.win();
+        spawnPetals(k.x+k.w/2, k.y+k.h/2);
+        pushNotif({ iconKind:'crown', title:'COURONNE FLEURIE OBTENUE', desc:'Invincible 7s — traverse les ennemis et hazards', color:'#f4d35e' });
+      }
+      else {
+        spawnCoinBurst(k.x+k.w/2, k.y+k.h/2);
+      }
+      if (k.kind === 'tea') spawnCoinBurst(k.x+k.w/2, k.y+k.h/2);
+    }
+  }
+
+  // Enemy collisions
+  for (const e of game.enemies) {
+    if (!e.alive) continue;
+    if (e.flies && e.type === 'smog') {
+      if (rectOverlap(entBB(p), { x:e.x, y:e.y, w:e.w, h:e.h })) {
+        if (p.powerInvinc > 0) {
+          // Crown clears the smog!
+          e.alive = false; e.deathTimer = 0;
+          spawnPuff(e.x+e.w/2, e.y+e.h/2, '#dddddd');
+          game.score += 150;
+          showFloatText("PSCHITT !", e.x+e.w/2, e.y, '#f4e6c8');
+        } else if (p.invuln <= 0) killPlayer();
+      }
+      continue;
+    }
+    const pb = entBB(p);
+    const eb = { x:e.x, y:e.y, w:e.w, h:e.h };
+    if (rectOverlap(pb, eb)) {
+      const playerFeet = pb.y + pb.h;
+      if (p.vy > 0 && playerFeet < eb.y + 14) {
+        // STOMP
+        if (e.isBoss) {
+          e.hp--;
+          p.vy = JUMP_V * 0.8;
+          spawnPuff(e.x+e.w/2, e.y, '#ffd6e0');
+          SFX.stomp();
+          if (e.hp <= 0) {
+            e.alive = false;
+            game.score += 1000;
+            game.bossKilled = true;
+            SFX.win();
+            spawnPetals(e.x+e.w/2, e.y+e.h/2);
+            game.shake = 20;
+            showFloatText("LA REINE EST TOMBÉE !", e.x+e.w/2, e.y-20, '#f4d35e');
+          } else {
+            e.facing *= -1;
+            showFloatText("Pas amusée du tout !", e.x+e.w/2, e.y-10, '#ffffff');
+          }
+        } else {
+          e.alive = false;
+          p.vy = JUMP_V * 0.6;
+          game.score += 100;
+          SFX.stomp();
+          spawnPuff(e.x+e.w/2, e.y+e.h/2);
+        }
+      } else if (p.powerInvinc > 0) {
+        // Walk through enemies = kill them
+        if (!e.isBoss) {
+          e.alive = false;
+          game.score += 100;
+          SFX.stomp();
+          spawnPetals(e.x+e.w/2, e.y+e.h/2);
+        } else {
+          // Bosses just take a hit
+          e.hp--;
+          if (e.hp <= 0) {
+            e.alive = false; game.bossKilled = true;
+            game.score += 1000; SFX.win(); spawnPetals(e.x+e.w/2, e.y+e.h/2);
+          }
+          p.powerInvinc = Math.max(0, p.powerInvinc - 60);  // boss costs invinc time
+        }
+      } else if (p.invuln <= 0) {
+        killPlayer();
+      }
+    }
+  }
+
+  // Check level end flag
+  const px = Math.floor((p.x + p.w/2) / TILE);
+  const py = Math.floor((p.y + p.h/2) / TILE);
+  if (tileAt(game.level, px, py) === 'F' || tileAt(game.level, px, py-1) === 'F') {
+    if (game.levelIdx === LEVELS.length - 1 && !game.bossKilled) {
+      // need to defeat boss first
+    } else {
+      p.won = true;
+      SFX.win();
+      spawnPetals(p.x+p.w/2, p.y);
+      setTimeout(() => {
+        if (game.levelIdx === LEVELS.length - 1) {
+          game.state = 'win';
+        } else {
+          game.state = 'intermission';
+          game.intermissionTimer = 0;
+        }
+      }, 1400);
+    }
+  }
+
+  if (p.invuln > 0) p.invuln--;
+  if (p.hurtFlash > 0) p.hurtFlash--;
+}
+
+function killPlayer() {
+  const p = game.player;
+  if (p.dead) return;
+  p.dead = true;
+  p.vy = -8;
+  p.vx = 0;
+  game.lives--;
+  game.shake = 18;
+  game.flashRed = 20;
+  SFX.lose();
+  spawnPetals(p.x+p.w/2, p.y+p.h/2);
+  setTimeout(() => {
+    if (game.lives <= 0) {
+      game.state = 'gameover';
+    } else {
+      // restart current level
+      loadLevel(game.levelIdx);
+    }
+  }, 1500);
+}
+
+// ----------------------------------------------------------------------------
+//  LEVEL LOADING
+// ----------------------------------------------------------------------------
+function loadLevel(idx) {
+  game.levelIdx = idx;
+  const raw = RAW_LEVELS[idx];
+  game.level = parseLevel(raw);
+  game.player = makePlayer(game.level.start);
+  game.enemies = (raw.enemies || []).map(makeEnemy);
+  game.pickups = buildPickups(game.level);
+  game.camera.x = 0; game.camera.y = 0;
+  game.particles = [];
+  game.floatTexts = [];
+  game.notifications = [];
+  game.state = 'playing';
+  game.bossKilled = false;
+  game.message = '';
+  game.shake = 0;
+  // Reset per-level counters and decor flags
+  game.collected = { tea:0, lantern:0, gear:0, rose:0, brush:0 };
+  game.decorTriggered = { tea:false, lantern:false, gear:false, rose:false, brush:false };
+  game.decorTransition = 0;
+  // Apply selected power-up for the whole level
+  const longDur = 60 * 999;
+  const sp = game.selectedPower;
+  const p = game.player;
+  if (sp === 'ribbon')         p.powerDoubleJump = longDur;
+  else if (sp === 'shawl')     p.powerSprint = longDur;
+  else if (sp === 'crown')     p.powerInvinc = 60 * 30;
+  else if (sp === 'fireball')  p.powerFireball = longDur;
+  else if (sp === 'fly')       p.powerFly = longDur;
+  else if (sp === 'magnet')    p.powerMagnet = longDur;
+  else if (sp === 'slowmo')    p.powerSlowmo = longDur;
+  else if (sp === 'scoreboost') p.powerScoreBoost = longDur;
+  else if (sp === 'groundpound') p.powerGroundpound = longDur;
+  else if (sp === 'brushcrea') { p.powerBrush = longDur; p.brushPlatesLeft = 3; }
+  // Initial notification announcing the power
+  if (sp) {
+    const power = POWER_POOL.find(pp => pp.kind === sp);
+    if (power) pushNotif({ iconKind: power.icon, title: power.name, desc: power.desc + (sp==='fireball'||sp==='brushcrea' ? '' : ''), color: power.color });
+  }
+  // Tutorial notif
+  pushNotif({ iconKind:'tea', title: 'OBJECTIF', desc: 'Atteins le drapeau ! Collecte aussi les '+ ({lantern:'lanternes',gear:'engrenages',rose:'roses',brush:'pinceaux'}[LEVEL_THEME_OBJECT[idx]] || 'objets'), color: '#f4d35e' });
+  game.projectiles = [];
+}
+
+// ----------------------------------------------------------------------------
+//  CAMERA
+// ----------------------------------------------------------------------------
+function updateCamera() {
+  const p = game.player;
+  const targetX = p.x + p.w/2 - W/2;
+  const targetY = p.y + p.h/2 - H/2;
+  game.camera.x += (targetX - game.camera.x) * 0.12;
+  game.camera.y += (targetY - game.camera.y) * 0.12;
+  game.camera.x = Math.max(0, Math.min(game.level.pixelW - W, game.camera.x));
+  game.camera.y = Math.max(0, Math.min(game.level.pixelH - H, game.camera.y));
+}
+
+// ============================================================================
+//  RENDERING
+// ============================================================================
+
+// --- BACKGROUNDS ---
+function drawBackground(theme, t) {
+  switch(theme) {
+    case 'london':  drawLondonBG(t); break;
+    case 'factory': drawFactoryBG(t); break;
+    case 'moor':    drawMoorBG(t); break;
+    case 'bigben':  drawBigBenBG(t); break;
+    default: ctx.fillStyle='#87729a'; ctx.fillRect(0,0,W,H);
+  }
+  // Theme decor overlay if objective met
+  drawDecorOverlay(t);
+}
+
+function drawDecorOverlay(t) {
+  const d = game.decorTriggered;
+  const tr = Math.min(1, game.decorTransition / 60);
+  // ===== LANTERN: street lights all bright, warm orange glow, dusk darkens =====
+  if (d.lantern) {
+    ctx.save();
+    ctx.globalAlpha = tr * 0.55;
+    ctx.fillStyle = '#1a0f24';
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+    // Many floating warm halos
+    for (let i = 0; i < 12; i++) {
+      const lx = (i*97 + Math.sin(t*0.005+i)*30) % W;
+      const ly = H*0.55 + Math.cos(t*0.007+i)*40;
+      const radius = 50 + Math.sin(t*0.05+i)*8;
+      const grad = ctx.createRadialGradient(lx, ly, 4, lx, ly, radius);
+      grad.addColorStop(0, `rgba(255,200,80,${0.6*tr})`);
+      grad.addColorStop(1, 'rgba(255,200,80,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(lx-radius, ly-radius, radius*2, radius*2);
+    }
+  }
+  // ===== GEAR: factory becomes mechanical nightmare =====
+  if (d.gear) {
+    ctx.save();
+    ctx.globalAlpha = tr * 0.5;
+    ctx.fillStyle = '#5a0808';
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+    // Giant rotating gears in BG
+    for (let i = 0; i < 6; i++) {
+      const gx = (i*200 + 80) % (W+150) - 50;
+      const gy = 80 + (i%2)*180;
+      const r = 50 + i*8;
+      ctx.save();
+      ctx.translate(gx, gy);
+      ctx.rotate(t * (i%2===0 ? 0.02 : -0.025) + i);
+      ctx.globalAlpha = tr * 0.4;
+      ctx.fillStyle = '#8a2020';
+      for (let j = 0; j < 12; j++) {
+        ctx.save(); ctx.rotate(j*Math.PI/6);
+        ctx.fillRect(-6, -r-10, 12, 18);
+        ctx.restore();
+      }
+      ctx.fillStyle = '#c82020';
+      ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#3a0808';
+      ctx.beginPath(); ctx.arc(0, 0, 8, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+  }
+  // ===== ROSE: moor blooms, sky brightens =====
+  if (d.rose) {
+    ctx.save();
+    // Brighten the sky to a sunny pinkish-blue
+    const grad = ctx.createLinearGradient(0, 0, 0, H*0.7);
+    grad.addColorStop(0, `rgba(180, 200, 255, ${0.4*tr})`);
+    grad.addColorStop(1, `rgba(255, 200, 220, ${0.3*tr})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H*0.7);
+    ctx.restore();
+    // Big roses floating in the air
+    for (let i = 0; i < 20; i++) {
+      const rx = ((i*113 + t*0.4) % (W+60)) - 30;
+      const ry = (i*53 % H) - 20 + Math.sin(t*0.02 + i)*8;
+      ctx.save();
+      ctx.translate(rx, ry);
+      ctx.globalAlpha = tr * 0.85;
+      const sz = 0.6 + (i%3)*0.3;
+      ctx.scale(sz, sz);
+      drawFlower(0, 0, 7, i%2===0 ? '#e94f64' : '#f4486c', '#f4d35e');
+      ctx.restore();
+    }
+  }
+  // ===== BRUSH: world becomes a Frida painting =====
+  if (d.brush) {
+    ctx.save();
+    // Bright colorful overlay tinted with rainbow strokes
+    ctx.globalAlpha = tr * 0.45;
+    const grad = ctx.createLinearGradient(0, 0, W, H);
+    grad.addColorStop(0,   '#3a7a3a');
+    grad.addColorStop(0.3, '#f4c534');
+    grad.addColorStop(0.6, '#e94f64');
+    grad.addColorStop(1,   '#1a3a8a');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+    // Brush strokes
+    const colors = ['#c82040','#f4c534','#1a5aa8','#3a7a3a','#e94f64','#fff4d6'];
+    for (let i = 0; i < 30; i++) {
+      const sx = (i*61 + Math.sin(t*0.005+i)*15) % W;
+      const sy = (i*37 + Math.cos(t*0.007+i)*20) % H;
+      ctx.save();
+      ctx.globalAlpha = tr * 0.5;
+      ctx.fillStyle = colors[i%colors.length];
+      ctx.translate(sx, sy);
+      ctx.rotate(i*0.5);
+      ctx.fillRect(-12, -2, 24, 4);
+      ctx.restore();
+    }
+    // Subtle dancing flowers
+    for (let i = 0; i < 12; i++) {
+      const fx = (i*83 + t*0.3) % W;
+      const fy = (i*67) % H;
+      ctx.save();
+      ctx.globalAlpha = tr * 0.8;
+      drawFlower(fx, fy, 5+i%3, colors[i%colors.length], '#fff4d6');
+      ctx.restore();
+    }
+  }
+}
+
+function drawLondonBG(t) {
+  // dusk sky gradient
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, '#3d2c4a');
+  g.addColorStop(0.4, '#7c5e7a');
+  g.addColorStop(0.8, '#c98a6b');
+  g.addColorStop(1, '#5a3e44');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // moon
+  ctx.fillStyle = '#fff4d6';
+  ctx.beginPath(); ctx.arc(W-120, 80, 32, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#7c5e7a';
+  ctx.beginPath(); ctx.arc(W-105, 70, 28, 0, Math.PI*2); ctx.fill();
+
+  // distant skyline parallax
+  const offX = game.camera.x * 0.2;
+  ctx.fillStyle = 'rgba(40, 25, 50, 0.7)';
+  for (let i = 0; i < 14; i++) {
+    const x = (i*140 - offX) % (W + 200) - 100;
+    const bh = 80 + ((i*37)%70);
+    ctx.fillRect(x, H-180-bh, 110, bh+50);
+    // chimneys
+    ctx.fillRect(x+15, H-180-bh-15, 12, 18);
+    ctx.fillRect(x+60, H-180-bh-20, 10, 22);
+    // smog from chimneys
+    ctx.fillStyle = 'rgba(80,60,80,0.4)';
+    ctx.beginPath();
+    ctx.arc(x+21, H-180-bh-25+Math.sin(t*0.01+i)*3, 16, 0, Math.PI*2);
+    ctx.arc(x+34, H-180-bh-35+Math.sin(t*0.013+i)*3, 12, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(40, 25, 50, 0.7)';
+    // windows
+    for (let wy=0; wy<3; wy++) for (let wx=0; wx<3; wx++) {
+      const lit = ((i+wx+wy*2)%5)===0;
+      ctx.fillStyle = lit ? '#f7c948' : '#2a1a2e';
+      ctx.fillRect(x+15+wx*30, H-160-bh+wy*22, 10, 12);
+    }
+    ctx.fillStyle = 'rgba(40, 25, 50, 0.7)';
+  }
+
+  // closer foggy band
+  ctx.fillStyle = 'rgba(180, 160, 170, 0.25)';
+  ctx.fillRect(0, H-140 + Math.sin(t*0.01)*5, W, 60);
+
+  // Floating Union Jack on a pole
+  const flagX = (W - 250 + Math.sin(t*0.005)*8) | 0;
+  const flagY = 50;
+  drawUnionJackFlag(flagX, flagY, t, 0.8);
+
+  // Victorian carriage in foreground silhouette
+  drawCarriage(t);
+}
+
+function drawUnionJackFlag(x, y, t, scale=1) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  // pole
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(0, 0, 3, 120);
+  ctx.fillStyle = '#f4d35e';
+  ctx.beginPath(); ctx.arc(1.5, -3, 4, 0, Math.PI*2); ctx.fill();
+  // flag (wavy)
+  const wave = Math.sin(t*0.08)*4;
+  const W_F = 70, H_F = 42;
+  ctx.save();
+  ctx.translate(3, 5);
+  // Background blue
+  ctx.fillStyle = '#1a3a8a';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  for (let i = 0; i <= W_F; i+=4) {
+    const wy = Math.sin((i*0.1)+t*0.08)*3;
+    ctx.lineTo(i, wy);
+  }
+  ctx.lineTo(W_F, H_F + wave*0.5);
+  for (let i = W_F; i >= 0; i-=4) {
+    const wy = Math.sin((i*0.1)+t*0.08)*3;
+    ctx.lineTo(i, H_F + wy);
+  }
+  ctx.closePath();
+  ctx.fill();
+  // Simplified Union Jack pattern
+  ctx.clip();
+  // White diagonal cross (St Andrew)
+  ctx.strokeStyle = '#f4f4f4';
+  ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(W_F, H_F); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(W_F,0); ctx.lineTo(0, H_F); ctx.stroke();
+  // Red diagonal (St Patrick)
+  ctx.strokeStyle = '#c82030';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(W_F, H_F); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(W_F,0); ctx.lineTo(0, H_F); ctx.stroke();
+  // White cross (St George border)
+  ctx.fillStyle = '#f4f4f4';
+  ctx.fillRect(0, H_F/2-7, W_F, 14);
+  ctx.fillRect(W_F/2-7, 0, 14, H_F);
+  // Red cross
+  ctx.fillStyle = '#c82030';
+  ctx.fillRect(0, H_F/2-3, W_F, 6);
+  ctx.fillRect(W_F/2-3, 0, 6, H_F);
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawCarriage(t) {
+  // Slow-moving carriage going RIGHT-TO-LEFT (head leads the way)
+  const speed = 0.4;
+  const cx = (W + 100) - ((t * speed) % (W + 280));
+  const cy = H - 175;
+  ctx.save();
+  ctx.fillStyle = 'rgba(15, 8, 15, 0.85)';
+  // horse (silhouette)
+  ctx.beginPath();
+  ctx.ellipse(cx, cy+8, 16, 8, 0, 0, Math.PI*2); ctx.fill();
+  // legs
+  ctx.fillRect(cx-12, cy+12, 3, 12);
+  ctx.fillRect(cx-2, cy+12, 3, 12);
+  ctx.fillRect(cx+8, cy+12, 3, 12);
+  ctx.fillRect(cx+12, cy+12, 3, 12);
+  // head
+  ctx.beginPath();
+  ctx.ellipse(cx-18, cy+2, 6, 5, 0.5, 0, Math.PI*2); ctx.fill();
+  // ears
+  ctx.beginPath();
+  ctx.moveTo(cx-19, cy-4); ctx.lineTo(cx-21, cy-7); ctx.lineTo(cx-17, cy-5);
+  ctx.closePath(); ctx.fill();
+  // carriage body
+  ctx.fillRect(cx+18, cy-10, 38, 22);
+  // roof
+  ctx.beginPath();
+  ctx.moveTo(cx+18, cy-10); ctx.lineTo(cx+22, cy-18); ctx.lineTo(cx+52, cy-18); ctx.lineTo(cx+56, cy-10); ctx.closePath(); ctx.fill();
+  // wheels
+  const wob = t * 0.1;
+  ctx.beginPath(); ctx.arc(cx+25, cy+14, 7, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx+50, cy+14, 7, 0, Math.PI*2); ctx.fill();
+  // spokes hint
+  ctx.strokeStyle = 'rgba(40,30,40,0.4)';
+  ctx.lineWidth = 1;
+  for (let i=0; i<4; i++) {
+    const a = i*Math.PI/2 + wob;
+    ctx.beginPath();
+    ctx.moveTo(cx+25, cy+14);
+    ctx.lineTo(cx+25 + Math.cos(a)*6, cy+14 + Math.sin(a)*6);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx+50, cy+14);
+    ctx.lineTo(cx+50 + Math.cos(a)*6, cy+14 + Math.sin(a)*6);
+    ctx.stroke();
+  }
+  // small lantern on carriage
+  ctx.fillStyle = 'rgba(255, 200, 80, 0.9)';
+  ctx.beginPath(); ctx.arc(cx+55, cy-12, 3, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(255, 200, 80, 0.3)';
+  ctx.beginPath(); ctx.arc(cx+55, cy-12, 8, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawFactoryBG(t) {
+  // sickly green sky
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, '#2c1d1d');
+  g.addColorStop(0.6, '#7a5d3a');
+  g.addColorStop(1, '#3a2a1a');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // sun struggling through smog
+  ctx.fillStyle = 'rgba(255, 180, 80, 0.4)';
+  ctx.beginPath(); ctx.arc(W*0.7, 110, 50, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(255, 180, 80, 0.2)';
+  ctx.beginPath(); ctx.arc(W*0.7, 110, 80, 0, Math.PI*2); ctx.fill();
+
+  // factory chimneys far
+  const offX = game.camera.x * 0.3;
+  for (let i = 0; i < 10; i++) {
+    const x = (i*180 - offX) % (W + 300) - 150;
+    const ch = 240 + ((i*53)%80);
+    ctx.fillStyle = '#3a2a2a';
+    ctx.fillRect(x, H-100-ch, 50, ch);
+    ctx.fillStyle = '#1a0e0e';
+    ctx.fillRect(x-4, H-100-ch, 58, 12);
+    // smoke
+    ctx.fillStyle = 'rgba(60,50,45,0.6)';
+    for (let s=0; s<4; s++) {
+      const sx = x+25 + Math.sin(t*0.01 + i + s)*8;
+      const sy = H-100-ch - s*30 - (t*0.5 % 30);
+      ctx.beginPath();
+      ctx.arc(sx, sy, 20-s*2, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // foreground bricks band
+  ctx.fillStyle = 'rgba(60,30,30,0.5)';
+  ctx.fillRect(0, H-80, W, 80);
+}
+
+function drawMoorBG(t) {
+  // overcast misty sky
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, '#7a8a9a');
+  g.addColorStop(0.6, '#a8b4be');
+  g.addColorStop(1, '#5a6a4a');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // distant rolling hills
+  const offX = game.camera.x * 0.25;
+  for (let layer = 2; layer >= 0; layer--) {
+    ctx.fillStyle = `rgba(${50+layer*30},${70+layer*30},${60+layer*30},0.9)`;
+    ctx.beginPath();
+    ctx.moveTo(0, H);
+    for (let x = -100; x <= W + 100; x += 20) {
+      const wx = x + offX * (0.5 + layer*0.2);
+      const y = H - 150 - layer*60 + Math.sin(wx*0.008 + layer)*40 + Math.cos(wx*0.003)*30;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(W, H); ctx.closePath(); ctx.fill();
+  }
+
+  // mist
+  ctx.fillStyle = 'rgba(220,220,220,0.25)';
+  ctx.fillRect(0, H-200+Math.sin(t*0.01)*8, W, 80);
+  ctx.fillStyle = 'rgba(220,220,220,0.15)';
+  ctx.fillRect(0, H-260+Math.sin(t*0.008+1)*10, W, 50);
+
+  // tiny crows
+  ctx.fillStyle = '#1a1a1a';
+  for (let i=0;i<5;i++) {
+    const cx = ((t*0.5 + i*180) % (W+200)) - 100;
+    const cy = 80 + i*30 + Math.sin(t*0.05 + i)*6;
+    const flap = Math.sin(t*0.2 + i) > 0;
+    ctx.beginPath();
+    if (flap) { ctx.moveTo(cx-6, cy); ctx.lineTo(cx, cy-3); ctx.lineTo(cx+6, cy); }
+    else      { ctx.moveTo(cx-6, cy-2); ctx.lineTo(cx, cy+2); ctx.lineTo(cx+6, cy-2); }
+    ctx.stroke();
+  }
+}
+
+function drawBigBenBG(t) {
+  // night sky
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, '#0d1530');
+  g.addColorStop(0.6, '#2a2050');
+  g.addColorStop(1, '#503060');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // stars
+  for (let i=0; i<80; i++) {
+    const sx = (i*97) % W;
+    const sy = (i*53) % (H*0.7);
+    const tw = (Math.sin(t*0.05 + i)*0.5+0.5);
+    ctx.fillStyle = `rgba(255,255,220,${0.4+tw*0.5})`;
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+  // big moon
+  ctx.fillStyle = '#f7e9b5';
+  ctx.beginPath(); ctx.arc(W*0.75, 100, 60, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.1)';
+  for (let i=0;i<6;i++) {
+    ctx.beginPath();
+    ctx.arc(W*0.75 + Math.cos(i)*30, 100 + Math.sin(i)*30, 6+i, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // huge clock tower silhouette in background
+  const offX = game.camera.x * 0.4;
+  ctx.fillStyle = 'rgba(20,15,35,0.8)';
+  const tx = W*0.5 - offX*0.5;
+  ctx.fillRect(tx-60, 200, 120, H-200);
+  ctx.fillRect(tx-80, 180, 160, 30);
+  // clock face
+  ctx.fillStyle = '#f7e9b5';
+  ctx.beginPath(); ctx.arc(tx, 280, 38, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#3a2a4a';
+  // hands - 10:10 classic
+  ctx.save();
+  ctx.translate(tx, 280);
+  ctx.lineWidth = 3; ctx.strokeStyle = '#3a2a4a';
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(-20,-12); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(20,-15); ctx.stroke();
+  ctx.restore();
+  // spire
+  ctx.fillStyle = 'rgba(20,15,35,0.8)';
+  ctx.beginPath();
+  ctx.moveTo(tx-30, 180); ctx.lineTo(tx, 100); ctx.lineTo(tx+30, 180);
+  ctx.closePath(); ctx.fill();
+}
+
+// --- TILE RENDERING ---
+function drawTiles(level, t) {
+  const cx0 = Math.floor(game.camera.x / TILE);
+  const cy0 = Math.floor(game.camera.y / TILE);
+  const cx1 = Math.min(level.w, cx0 + Math.ceil(W/TILE) + 2);
+  const cy1 = Math.min(level.h, cy0 + Math.ceil(H/TILE) + 2);
+  for (let y = cy0; y < cy1; y++) {
+    for (let x = cx0; x < cx1; x++) {
+      if (x<0||y<0) continue;
+      const c = level.grid[y][x];
+      if (c === '.') continue;
+      drawTile(c, x*TILE, y*TILE, level.theme, t, x, y, level);
+    }
+  }
+}
+
+function drawTile(c, px, py, theme, t, tx, ty, level) {
+  switch (c) {
+    case '#': drawGround(px, py, theme, tx, ty, level); break;
+    case '=': drawBrick(px, py, theme); break;
+    case '?': drawQBlock(px, py, t); break;
+    case '^': drawSpike(px, py, theme); break;
+    case 'F': drawFlag(px, py, theme, t); break;
+    case '|': drawLamp(px, py, theme, t); break;
+    case '-': drawBeam(px, py, theme); break;
+    case 'G': drawGear(px, py, t); break;
+    case '~': /* drawn as enemy */ break;
+    case 'T': drawBarrel(px, py); break;
+    case 'B': drawBench(px, py); break;
+  }
+}
+
+function drawGround(x, y, theme, tx, ty, level) {
+  // Top tile vs interior
+  const above = ty > 0 ? level.grid[ty-1][tx] : '.';
+  const isTop = above !== '#';
+  switch(theme) {
+    case 'london': {
+      ctx.fillStyle = '#564a40';
+      ctx.fillRect(x, y, TILE, TILE);
+      // cobblestones pattern
+      ctx.fillStyle = '#6b5a4a';
+      for (let i=0; i<2; i++) for (let j=0; j<2; j++) {
+        ctx.beginPath();
+        ctx.arc(x + 8 + i*16, y + 8 + j*16, 6, 0, Math.PI*2);
+        ctx.fill();
+      }
+      ctx.fillStyle = '#4a3a30';
+      ctx.fillRect(x, y, TILE, 2);
+      if (isTop) {
+        ctx.fillStyle = '#7a6a5a';
+        ctx.fillRect(x, y, TILE, 3);
+      }
+      break;
+    }
+    case 'factory': {
+      ctx.fillStyle = '#4a2a20';
+      ctx.fillRect(x, y, TILE, TILE);
+      // rivets
+      ctx.fillStyle = '#2a1a10';
+      for (let i=0;i<2;i++) for (let j=0;j<2;j++) {
+        ctx.beginPath();
+        ctx.arc(x+8+i*16, y+8+j*16, 2, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.fillStyle = '#6a4a3a';
+      ctx.fillRect(x, y, TILE, 2);
+      if (isTop) {
+        ctx.fillStyle = '#8a5a3a';
+        ctx.fillRect(x, y, TILE, 3);
+      }
+      break;
+    }
+    case 'moor': {
+      ctx.fillStyle = '#4a3a2a';
+      ctx.fillRect(x, y, TILE, TILE);
+      // earth speckle
+      ctx.fillStyle = '#3a2a1a';
+      for (let i=0;i<5;i++) {
+        ctx.fillRect(x + ((tx*7+i*11)%TILE), y + ((ty*5+i*9)%TILE), 2, 2);
+      }
+      if (isTop) {
+        // grass top
+        ctx.fillStyle = '#5a7a3a';
+        ctx.fillRect(x, y, TILE, 6);
+        ctx.fillStyle = '#7a9a4a';
+        for (let i=0;i<6;i++) {
+          ctx.fillRect(x + ((tx*3+i*5)%TILE), y-1, 2, 5);
+        }
+      }
+      break;
+    }
+    case 'bigben': {
+      // stone block
+      ctx.fillStyle = '#5a5466';
+      ctx.fillRect(x, y, TILE, TILE);
+      ctx.fillStyle = '#403a4a';
+      ctx.fillRect(x, y+TILE-2, TILE, 2);
+      ctx.fillRect(x+TILE-2, y, 2, TILE);
+      ctx.fillStyle = '#706a82';
+      ctx.fillRect(x, y, TILE, 2);
+      ctx.fillRect(x, y, 2, TILE);
+      if (isTop) {
+        ctx.fillStyle = '#8a84a0';
+        ctx.fillRect(x, y, TILE, 3);
+      }
+      break;
+    }
+  }
+}
+
+function drawBrick(x, y, theme) {
+  ctx.fillStyle = theme==='factory'?'#7a4a3a':'#a86048';
+  ctx.fillRect(x, y, TILE, TILE);
+  ctx.fillStyle = theme==='factory'?'#4a2a20':'#6a3024';
+  // mortar lines
+  ctx.fillRect(x, y, TILE, 2);
+  ctx.fillRect(x, y+15, TILE, 2);
+  ctx.fillRect(x, y+TILE-2, TILE, 2);
+  ctx.fillRect(x+10, y+2, 2, 14);
+  ctx.fillRect(x+22, y+2, 2, 14);
+  ctx.fillRect(x+16, y+17, 2, 14);
+  ctx.fillRect(x, y, 2, TILE);
+  ctx.fillRect(x+TILE-2, y, 2, TILE);
+  // highlights
+  ctx.fillStyle = theme==='factory'?'#9a6a4a':'#c87858';
+  ctx.fillRect(x+2, y+2, 8, 2);
+  ctx.fillRect(x+18, y+17, 6, 2);
+}
+
+function drawQBlock(x, y, t) {
+  const pulse = Math.sin(t*0.1)*0.5 + 0.5;
+  ctx.fillStyle = '#e8a838';
+  ctx.fillRect(x, y, TILE, TILE);
+  ctx.fillStyle = '#b07820';
+  ctx.fillRect(x, y, TILE, 2);
+  ctx.fillRect(x, y+TILE-2, TILE, 2);
+  ctx.fillRect(x, y, 2, TILE);
+  ctx.fillRect(x+TILE-2, y, 2, TILE);
+  // rivets
+  ctx.fillStyle = '#6a4810';
+  [[4,4],[TILE-6,4],[4,TILE-6],[TILE-6,TILE-6]].forEach(([dx,dy])=>{
+    ctx.beginPath(); ctx.arc(x+dx,y+dy,2,0,Math.PI*2); ctx.fill();
+  });
+  // question mark
+  ctx.fillStyle = `rgba(255,255,255,${0.5+pulse*0.4})`;
+  ctx.font = 'bold 22px Georgia';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('?', x+TILE/2, y+TILE/2+1);
+  ctx.fillStyle = '#3a2810';
+  ctx.fillText('?', x+TILE/2, y+TILE/2);
+}
+
+function drawSpike(x, y, theme) {
+  ctx.fillStyle = theme==='factory'?'#aaaaaa':'#3a3038';
+  const baseY = y + TILE;
+  for (let i=0; i<3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(x + 2 + i*10, baseY);
+    ctx.lineTo(x + 7 + i*10, y + 4);
+    ctx.lineTo(x + 12 + i*10, baseY);
+    ctx.closePath();
+    ctx.fill();
+    // highlight
+    ctx.fillStyle = theme==='factory'?'#dddddd':'#5a4858';
+    ctx.beginPath();
+    ctx.moveTo(x + 4 + i*10, baseY - 2);
+    ctx.lineTo(x + 7 + i*10, y + 6);
+    ctx.lineTo(x + 7 + i*10, baseY - 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = theme==='factory'?'#aaaaaa':'#3a3038';
+  }
+}
+
+function drawFlag(x, y, theme, t) {
+  // pole
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(x + TILE/2 - 2, y - TILE*3, 4, TILE*4);
+  // British flag-ish - Union Jack-y
+  ctx.save();
+  ctx.translate(x + TILE/2 + 2, y - TILE*3 + 4);
+  const wave = Math.sin(t*0.1) * 3;
+  ctx.fillStyle = '#1a3a8a';
+  ctx.fillRect(0, 0, 36, 24);
+  ctx.fillStyle = '#e8e8e8';
+  ctx.fillRect(0, 10, 36, 4);
+  ctx.fillRect(16, 0, 4, 24);
+  ctx.fillStyle = '#c8203a';
+  ctx.fillRect(0, 11, 36, 2);
+  ctx.fillRect(17, 0, 2, 24);
+  // diagonals
+  ctx.strokeStyle = '#e8e8e8';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(36,24); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(36,0); ctx.lineTo(0,24); ctx.stroke();
+  ctx.strokeStyle = '#c8203a'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(36,24); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(36,0); ctx.lineTo(0,24); ctx.stroke();
+  ctx.restore();
+  // ball top
+  ctx.fillStyle = '#f4d35e';
+  ctx.beginPath(); ctx.arc(x+TILE/2, y-TILE*3, 5, 0, Math.PI*2); ctx.fill();
+}
+
+function drawLamp(x, y, theme, t) {
+  // gas lamp
+  ctx.fillStyle = '#1a1410';
+  ctx.fillRect(x+TILE/2-2, y, 4, TILE);
+  ctx.beginPath(); ctx.arc(x+TILE/2, y, 8, 0, Math.PI*2); ctx.fill();
+  // flame
+  const flick = Math.sin(t*0.3)*2;
+  ctx.fillStyle = '#ffcc44';
+  ctx.beginPath();
+  ctx.moveTo(x+TILE/2, y-12+flick);
+  ctx.lineTo(x+TILE/2-3, y-2);
+  ctx.lineTo(x+TILE/2+3, y-2);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#ffeaa8';
+  ctx.beginPath(); ctx.arc(x+TILE/2, y-4, 2, 0, Math.PI*2); ctx.fill();
+  // glow
+  ctx.fillStyle = 'rgba(255,200,80,0.15)';
+  ctx.beginPath(); ctx.arc(x+TILE/2, y-2, 20, 0, Math.PI*2); ctx.fill();
+}
+
+function drawBeam(x, y, theme) {
+  ctx.fillStyle = theme==='factory'?'#5a4a3a':'#3a3a3a';
+  ctx.fillRect(x, y+12, TILE, 8);
+  ctx.fillStyle = theme==='factory'?'#3a2a1a':'#1a1a1a';
+  ctx.fillRect(x, y+12, TILE, 2);
+  ctx.fillRect(x, y+18, TILE, 2);
+  // rivets
+  ctx.fillStyle = '#1a1010';
+  ctx.beginPath(); ctx.arc(x+6, y+16, 2, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+TILE-6, y+16, 2, 0, Math.PI*2); ctx.fill();
+}
+
+function drawGear(x, y, t) {
+  const cx = x + TILE/2, cy = y + TILE/2;
+  const r = 14;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(t*0.05);
+  ctx.fillStyle = '#9a3030';
+  for (let i=0; i<8; i++) {
+    ctx.save();
+    ctx.rotate(i * Math.PI / 4);
+    ctx.fillRect(-3, -r-4, 6, 8);
+    ctx.restore();
+  }
+  ctx.fillStyle = '#c84040';
+  ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#7a1818';
+  ctx.beginPath(); ctx.arc(0,0,5,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawBarrel(x, y) {
+  ctx.fillStyle = '#7a4a20';
+  ctx.fillRect(x+2, y+2, TILE-4, TILE-2);
+  ctx.fillStyle = '#3a2010';
+  ctx.fillRect(x+2, y+8, TILE-4, 3);
+  ctx.fillRect(x+2, y+TILE-10, TILE-4, 3);
+}
+function drawBench(x, y) {
+  ctx.fillStyle = '#5a3a20';
+  ctx.fillRect(x, y+10, TILE, 6);
+  ctx.fillRect(x+3, y+18, 3, TILE-18);
+  ctx.fillRect(x+TILE-6, y+18, 3, TILE-18);
+}
+
+// ============================================================================
+//  CHARACTER SPRITES
+// ============================================================================
+
+// --- FRIDA KAHLO ---
+function drawFrida(p, t) {
+  const cx = p.x + p.w/2;
+  const cy = p.y + p.h/2;
+  const facing = p.facing;
+
+  // ==== Sprint motion lines BEHIND Frida ====
+  if (p.powerSprint > 0 && Math.abs(p.vx) > 3) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(90,138,206,0.6)';
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 4; i++) {
+      const dx = -facing * (10 + i*5);
+      ctx.beginPath();
+      ctx.moveTo(cx + dx, cy - 4 + i*3);
+      ctx.lineTo(cx + dx - facing*12, cy - 4 + i*3);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ==== Invincibility aura ====
+  if (p.powerInvinc > 0) {
+    ctx.save();
+    const pulse = (Math.sin(t*0.3)*0.5+0.5);
+    ctx.globalAlpha = 0.35 + pulse*0.25;
+    const grad = ctx.createRadialGradient(cx, cy, 8, cx, cy, 32);
+    grad.addColorStop(0, '#f4d35e');
+    grad.addColorStop(1, 'rgba(244,72,108,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(cx-40, cy-40, 80, 80);
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(facing, 1);
+
+  // Hurt flash
+  if (p.invuln > 0 && Math.floor(p.invuln/3) % 2 === 0) {
+    ctx.globalAlpha = 0.5;
+  }
+
+  // Walk bob
+  const onAir = !p.onGround;
+  const bob = onAir ? -1 : Math.sin(p.walkPhase)*1;
+  const armPhase = onAir ? 0.5 : Math.sin(p.walkPhase);
+  const legPhase = onAir ? 0 : Math.sin(p.walkPhase);
+
+  // === Dress (long traditional huipil-style, red with embroidery) ===
+  ctx.fillStyle = '#c8302a';
+  ctx.beginPath();
+  ctx.moveTo(-10, 0);
+  ctx.lineTo(-13, 14);
+  ctx.lineTo(13, 14);
+  ctx.lineTo(10, 0);
+  ctx.closePath(); ctx.fill();
+  // dress hem embroidery (yellow / blue)
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillRect(-13, 11, 26, 2);
+  ctx.fillStyle = '#1a5aa8';
+  for (let i=-12; i<=10; i+=4) {
+    ctx.fillRect(i, 9, 2, 2);
+  }
+
+  // === Legs (under dress) ===
+  ctx.fillStyle = '#a06848';
+  // back leg
+  ctx.fillRect(-6 + legPhase*1.5, 14, 4, 6);
+  // front leg
+  ctx.fillRect(2 - legPhase*1.5, 14, 4, 6);
+  // shoes (dark)
+  ctx.fillStyle = '#2a1810';
+  ctx.fillRect(-7 + legPhase*1.5, 19, 6, 2);
+  ctx.fillRect(1 - legPhase*1.5, 19, 6, 2);
+
+  // === Torso shawl (rebozo - blue) ===
+  ctx.fillStyle = '#2a5a8a';
+  ctx.beginPath();
+  ctx.moveTo(-10, -1+bob);
+  ctx.lineTo(-9, 4+bob);
+  ctx.lineTo(9, 4+bob);
+  ctx.lineTo(10, -1+bob);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillRect(-9, 2+bob, 18, 1);
+
+  // === Arms ===
+  ctx.fillStyle = '#c8302a';
+  // back arm
+  ctx.fillRect(-12, -2+bob, 3, 8 + armPhase*1);
+  // hand
+  ctx.fillStyle = '#a06848';
+  ctx.fillRect(-12, 6+bob+armPhase, 3, 3);
+  // front arm
+  ctx.fillStyle = '#c8302a';
+  ctx.fillRect(9, -2+bob, 3, 8 - armPhase*1);
+  ctx.fillStyle = '#a06848';
+  ctx.fillRect(9, 6+bob-armPhase, 3, 3);
+
+  // === Neck ===
+  ctx.fillStyle = '#a06848';
+  ctx.fillRect(-2, -3+bob, 4, 3);
+
+  // === Head ===
+  // face base
+  ctx.fillStyle = '#b87858';
+  ctx.beginPath();
+  ctx.ellipse(0, -11+bob, 8, 9, 0, 0, Math.PI*2);
+  ctx.fill();
+  // chin shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.1)';
+  ctx.beginPath(); ctx.arc(0, -6+bob, 4, 0, Math.PI); ctx.fill();
+
+  // === Hair (black) - on top and behind, with braid bun ===
+  ctx.fillStyle = '#1a0e0a';
+  // back hair
+  ctx.beginPath();
+  ctx.ellipse(0, -13+bob, 10, 7, 0, Math.PI, 0);
+  ctx.fill();
+  // bun behind
+  ctx.beginPath();
+  ctx.arc(-2, -20+bob, 6, 0, Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(3, -22+bob, 5, 0, Math.PI*2);
+  ctx.fill();
+  // hair side
+  ctx.fillRect(-9, -14+bob, 3, 4);
+  ctx.fillRect(6, -14+bob, 3, 4);
+
+  // === Flowers in hair (Frida signature) ===
+  // pink flower
+  drawFlower(-4, -22+bob, 4, '#f4486c', '#f4d35e');
+  // yellow flower
+  drawFlower(3, -24+bob, 3, '#f4c534', '#c83030');
+  // small flower
+  drawFlower(6, -19+bob, 2.5, '#e94f64', '#fff4d6');
+  // leaf
+  ctx.fillStyle = '#3a7a3a';
+  ctx.beginPath();
+  ctx.ellipse(-7, -20+bob, 3, 1.5, -0.5, 0, Math.PI*2);
+  ctx.fill();
+
+  // === The famous UNIBROW ===
+  ctx.fillStyle = '#0a0500';
+  ctx.beginPath();
+  ctx.moveTo(-6, -13+bob);
+  ctx.quadraticCurveTo(0, -15+bob, 6, -13+bob);
+  ctx.quadraticCurveTo(0, -12+bob, -6, -13+bob);
+  ctx.closePath(); ctx.fill();
+  // small subtle gap rendered as eyebrow body unified
+  ctx.fillRect(-5, -13+bob, 10, 1.5);
+
+  // === Eyes (dark, intense) ===
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(-5, -11+bob, 3, 2);
+  ctx.fillRect(2, -11+bob, 3, 2);
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-4, -11+bob, 2, 2);
+  ctx.fillRect(3, -11+bob, 2, 2);
+
+  // === Mustache hint (subtle - she had one) ===
+  ctx.fillStyle = '#1a0e0a';
+  ctx.fillRect(-2, -7+bob, 4, 1);
+
+  // === Mouth (red lips, slight smile) ===
+  ctx.fillStyle = '#a8203a';
+  ctx.beginPath();
+  ctx.moveTo(-3, -5+bob);
+  ctx.quadraticCurveTo(0, -3+bob, 3, -5+bob);
+  ctx.quadraticCurveTo(0, -4+bob, -3, -5+bob);
+  ctx.closePath(); ctx.fill();
+
+  // === Earrings ===
+  ctx.fillStyle = '#f4d35e';
+  ctx.beginPath(); ctx.arc(-8, -10+bob, 1.5, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(8, -10+bob, 1.5, 0, Math.PI*2); ctx.fill();
+
+  // === Necklace (chunky pre-columbian style) ===
+  ctx.fillStyle = '#3a7a3a';
+  ctx.beginPath(); ctx.arc(-3, -1+bob, 1.5, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#f4d35e';
+  ctx.beginPath(); ctx.arc(0, 0+bob, 2, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#c83030';
+  ctx.beginPath(); ctx.arc(3, -1+bob, 1.5, 0, Math.PI*2); ctx.fill();
+
+  ctx.restore();
+}
+
+function drawFlower(x, y, r, color, centerColor) {
+  ctx.fillStyle = color;
+  for (let i=0; i<5; i++) {
+    const a = (i/5)*Math.PI*2;
+    ctx.beginPath();
+    ctx.arc(x + Math.cos(a)*r*0.6, y + Math.sin(a)*r*0.6, r*0.55, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.fillStyle = centerColor;
+  ctx.beginPath(); ctx.arc(x, y, r*0.4, 0, Math.PI*2); ctx.fill();
+}
+
+// --- ENEMIES ---
+function drawEnemy(e, t) {
+  if (!e.alive && e.deathTimer > 0) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, 1 - e.deathTimer/30);
+    ctx.translate(e.x + e.w/2, e.y + e.h/2);
+    ctx.rotate(e.deathTimer * 0.15);
+  } else {
+    ctx.save();
+    ctx.translate(e.x + e.w/2, e.y + e.h/2);
+  }
+  ctx.scale(e.facing < 0 ? -1 : 1, 1);
+
+  switch(e.type) {
+    case 'bobby':   drawBobby(t, e); break;
+    case 'sweep':   drawSweep(t, e); break;
+    case 'topboss': drawTopboss(t, e); break;
+    case 'smog':    drawSmog(t, e); break;
+    case 'dog':     drawDog(t, e); break;
+    case 'sheep':   drawSheep(t, e); break;
+    case 'guard':   drawGuard(t, e); break;
+    case 'queen':   drawQueen(t, e); break;
+  }
+  ctx.restore();
+}
+
+// Bobby (Victorian policeman, blue uniform, custodian helmet)
+function drawBobby(t, e) {
+  const bob = Math.sin(t*0.15 + e.phase)*1;
+  // body
+  ctx.fillStyle = '#1a3a6a';
+  ctx.fillRect(-10, -4+bob, 20, 16);
+  // belt
+  ctx.fillStyle = '#1a1010';
+  ctx.fillRect(-10, 4+bob, 20, 2);
+  ctx.fillStyle = '#c8a830';
+  ctx.fillRect(-2, 4+bob, 4, 2);
+  // legs
+  ctx.fillStyle = '#1a1810';
+  ctx.fillRect(-7, 12+bob, 5, 6);
+  ctx.fillRect(2, 12+bob, 5, 6);
+  // head
+  ctx.fillStyle = '#e8c8a8';
+  ctx.beginPath(); ctx.ellipse(0,-10+bob,7,8,0,0,Math.PI*2); ctx.fill();
+  // helmet (custodian - tall rounded)
+  ctx.fillStyle = '#1a2a4a';
+  ctx.beginPath();
+  ctx.moveTo(-8, -10+bob);
+  ctx.lineTo(-7, -22+bob);
+  ctx.quadraticCurveTo(0, -28+bob, 7, -22+bob);
+  ctx.lineTo(8, -10+bob);
+  ctx.closePath(); ctx.fill();
+  // helmet badge
+  ctx.fillStyle = '#c8a830';
+  ctx.beginPath(); ctx.arc(0, -18+bob, 2, 0, Math.PI*2); ctx.fill();
+  // chinstrap
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(-7, -10+bob, 14, 1);
+  // angry mustache
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(-4, -8+bob, 8, 2);
+  // eyes
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-3, -12+bob, 2, 2);
+  ctx.fillRect(1, -12+bob, 2, 2);
+  // angry eyebrows
+  ctx.fillRect(-4, -14+bob, 3, 1);
+  ctx.fillRect(1, -14+bob, 3, 1);
+  // baton
+  ctx.fillStyle = '#5a3a20';
+  ctx.fillRect(9, 0+bob, 8, 2);
+}
+
+// Sweep (chimney sweep boy, sooty)
+function drawSweep(t, e) {
+  const bob = Math.sin(t*0.2 + e.phase)*1;
+  // body - tattered grey
+  ctx.fillStyle = '#3a3a40';
+  ctx.fillRect(-9, -2+bob, 18, 14);
+  // soot patches
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(-5, 4+bob, 4, 3);
+  ctx.fillRect(3, -1+bob, 3, 4);
+  // legs
+  ctx.fillStyle = '#2a2a2a';
+  ctx.fillRect(-7, 12+bob, 5, 4);
+  ctx.fillRect(2, 12+bob, 5, 4);
+  // head
+  ctx.fillStyle = '#a89888';
+  ctx.beginPath(); ctx.ellipse(0,-8+bob,6,7,0,0,Math.PI*2); ctx.fill();
+  // soot on face
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(-4, -4+bob, 3, 1);
+  ctx.fillRect(2, -5+bob, 2, 1);
+  // hat
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(-7, -14+bob, 14, 4);
+  ctx.fillRect(-5, -18+bob, 10, 5);
+  // eyes (wide, slightly creepy)
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(-4, -10+bob, 2, 2);
+  ctx.fillRect(2, -10+bob, 2, 2);
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-3, -10+bob, 1, 2);
+  ctx.fillRect(3, -10+bob, 1, 2);
+  // brush
+  ctx.fillStyle = '#5a3a20';
+  ctx.fillRect(9, -4+bob, 2, 12);
+  ctx.fillStyle = '#8a8a8a';
+  ctx.beginPath();
+  ctx.arc(10, -6+bob, 4, 0, Math.PI*2);
+  ctx.fill();
+}
+
+// Top-Hat Boss (factory owner, fat with monocle)
+function drawTopboss(t, e) {
+  const bob = Math.sin(t*0.1 + e.phase)*1.5;
+  // belly
+  ctx.fillStyle = '#1a1010';
+  ctx.beginPath();
+  ctx.ellipse(0, 2+bob, 14, 10, 0, 0, Math.PI*2);
+  ctx.fill();
+  // waistcoat
+  ctx.fillStyle = '#7a3030';
+  ctx.beginPath();
+  ctx.ellipse(0, 4+bob, 10, 7, 0, 0, Math.PI*2);
+  ctx.fill();
+  // watch chain
+  ctx.fillStyle = '#f4d35e';
+  for (let i=0; i<5; i++) ctx.fillRect(-6+i*3, 3+bob, 2, 1);
+  // arms
+  ctx.fillStyle = '#1a1010';
+  ctx.fillRect(-15, -2+bob, 5, 10);
+  ctx.fillRect(10, -2+bob, 5, 10);
+  // legs
+  ctx.fillRect(-7, 11+bob, 5, 7);
+  ctx.fillRect(2, 11+bob, 5, 7);
+  // head
+  ctx.fillStyle = '#f4c8a8';
+  ctx.beginPath(); ctx.arc(0, -8+bob, 7, 0, Math.PI*2); ctx.fill();
+  // mutton chops
+  ctx.fillStyle = '#8a4a20';
+  ctx.fillRect(-8, -8+bob, 2, 6);
+  ctx.fillRect(6, -8+bob, 2, 6);
+  // top hat
+  ctx.fillStyle = '#0a0506';
+  ctx.fillRect(-9, -15+bob, 18, 2);
+  ctx.fillRect(-7, -25+bob, 14, 10);
+  ctx.fillStyle = '#3a2010';
+  ctx.fillRect(-7, -19+bob, 14, 1);
+  // monocle
+  ctx.strokeStyle = '#c8a830';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(3, -8+bob, 3, 0, Math.PI*2); ctx.stroke();
+  ctx.fillStyle = '#aaeeff';
+  ctx.beginPath(); ctx.arc(3, -8+bob, 2.5, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#c8a830'; ctx.lineWidth = 0.8;
+  ctx.beginPath(); ctx.moveTo(6, -6+bob); ctx.lineTo(8, -2+bob); ctx.stroke();
+  // eye (one normal)
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-4, -9+bob, 2, 2);
+  // angry mouth + cigar
+  ctx.fillStyle = '#5a2010';
+  ctx.fillRect(-2, -4+bob, 5, 1);
+  ctx.fillStyle = '#7a4a20';
+  ctx.fillRect(3, -5+bob, 5, 2);
+  ctx.fillStyle = '#ff8800';
+  ctx.fillRect(8, -5+bob, 1, 2);
+  // cigar smoke
+  ctx.fillStyle = 'rgba(200,200,200,0.5)';
+  for (let i=0; i<3; i++) {
+    ctx.beginPath();
+    ctx.arc(10+Math.sin(t*0.05+i)*1, -8+bob-i*3, 2-i*0.5, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+// Smog Cloud (flying enemy)
+function drawSmog(t, e) {
+  const wob = Math.sin(t*0.1 + e.phase)*1;
+  // dark cloud
+  ctx.fillStyle = '#3a2a3a';
+  for (let i=0; i<5; i++) {
+    const a = (i/5)*Math.PI*2;
+    ctx.beginPath();
+    ctx.arc(Math.cos(a)*8, Math.sin(a)*5+wob, 8, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.beginPath();
+  ctx.arc(0, 0+wob, 12, 0, Math.PI*2);
+  ctx.fill();
+  // angry face
+  ctx.fillStyle = '#f4c534';
+  ctx.fillRect(-5, -3+wob, 3, 2);
+  ctx.fillRect(2, -3+wob, 3, 2);
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-4, -3+wob, 1, 2);
+  ctx.fillRect(3, -3+wob, 1, 2);
+  // angry mouth
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-3, 3+wob, 6, 1);
+  ctx.fillRect(-3, 3+wob, 1, 2);
+  ctx.fillRect(2, 3+wob, 1, 2);
+}
+
+// Dog (Hound of the Baskervilles)
+function drawDog(t, e) {
+  const bob = Math.sin(t*0.3 + e.phase)*1;
+  // body
+  ctx.fillStyle = '#3a2a20';
+  ctx.beginPath();
+  ctx.ellipse(0, 3+bob, 12, 6, 0, 0, Math.PI*2);
+  ctx.fill();
+  // legs
+  ctx.fillStyle = '#2a1810';
+  ctx.fillRect(-9, 8+bob, 3, 4);
+  ctx.fillRect(-4, 8+bob, 3, 4);
+  ctx.fillRect(3, 8+bob, 3, 4);
+  ctx.fillRect(7, 8+bob, 3, 4);
+  // tail
+  ctx.fillStyle = '#3a2a20';
+  ctx.fillRect(-14, -1+bob, 5, 3);
+  ctx.fillRect(-16, -3+bob, 3, 4);
+  // head
+  ctx.fillStyle = '#3a2a20';
+  ctx.beginPath();
+  ctx.ellipse(10, -1+bob, 6, 5, 0, 0, Math.PI*2);
+  ctx.fill();
+  // snout
+  ctx.fillStyle = '#2a1810';
+  ctx.fillRect(13, 0+bob, 5, 4);
+  ctx.fillStyle = '#0a0506';
+  ctx.fillRect(17, 0+bob, 2, 2);
+  // ears
+  ctx.fillStyle = '#1a1008';
+  ctx.beginPath();
+  ctx.moveTo(8, -5+bob); ctx.lineTo(6, -10+bob); ctx.lineTo(10, -7+bob);
+  ctx.closePath(); ctx.fill();
+  // eye glowing
+  ctx.fillStyle = '#ff4400';
+  ctx.fillRect(10, -2+bob, 2, 2);
+  // teeth
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.moveTo(13, 3+bob); ctx.lineTo(15, 5+bob); ctx.lineTo(17, 3+bob);
+  ctx.fill();
+}
+
+// Sheep (slow, big wool)
+function drawSheep(t, e) {
+  const bob = Math.sin(t*0.1 + e.phase)*1;
+  // wool body
+  ctx.fillStyle = '#f4e8d4';
+  for (let i=0; i<7; i++) {
+    const a = (i/7)*Math.PI*2;
+    ctx.beginPath();
+    ctx.arc(Math.cos(a)*9, Math.sin(a)*5+bob, 6, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.beginPath(); ctx.arc(0, 0+bob, 10, 0, Math.PI*2); ctx.fill();
+  // legs
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-8, 8+bob, 3, 4);
+  ctx.fillRect(-3, 8+bob, 3, 4);
+  ctx.fillRect(2, 8+bob, 3, 4);
+  ctx.fillRect(6, 8+bob, 3, 4);
+  // head (dark)
+  ctx.fillStyle = '#2a1810';
+  ctx.beginPath();
+  ctx.ellipse(11, -1+bob, 5, 4, 0, 0, Math.PI*2);
+  ctx.fill();
+  // ear
+  ctx.beginPath();
+  ctx.moveTo(10, -4+bob); ctx.lineTo(8, -7+bob); ctx.lineTo(12, -6+bob);
+  ctx.fill();
+  // eye - silly wide
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(13, -1+bob, 2, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#0a0506';
+  ctx.fillRect(13, -1+bob, 1, 1);
+}
+
+// Royal Guard (red coat, big bearskin hat)
+function drawGuard(t, e) {
+  const bob = Math.sin(t*0.15 + e.phase)*1;
+  // body red coat
+  ctx.fillStyle = '#c83030';
+  ctx.fillRect(-8, -2+bob, 16, 16);
+  // belt
+  ctx.fillStyle = '#1a1010';
+  ctx.fillRect(-8, 6+bob, 16, 2);
+  // buttons (gold)
+  ctx.fillStyle = '#f4d35e';
+  for (let i=0;i<3;i++) {
+    ctx.beginPath(); ctx.arc(0, 0+i*4+bob, 1.2, 0, Math.PI*2); ctx.fill();
+  }
+  // legs (black trousers)
+  ctx.fillStyle = '#1a1010';
+  ctx.fillRect(-6, 14+bob, 5, 6);
+  ctx.fillRect(1, 14+bob, 5, 6);
+  // boots
+  ctx.fillStyle = '#0a0506';
+  ctx.fillRect(-7, 19+bob, 6, 2);
+  ctx.fillRect(1, 19+bob, 6, 2);
+  // head
+  ctx.fillStyle = '#e8c8a8';
+  ctx.beginPath(); ctx.ellipse(0,-7+bob,5,6,0,0,Math.PI*2); ctx.fill();
+  // bearskin hat (huge)
+  ctx.fillStyle = '#0a0506';
+  ctx.beginPath();
+  ctx.moveTo(-7, -8+bob);
+  ctx.quadraticCurveTo(-9, -22+bob, 0, -26+bob);
+  ctx.quadraticCurveTo(9, -22+bob, 7, -8+bob);
+  ctx.closePath(); ctx.fill();
+  // chin strap
+  ctx.fillStyle = '#c8a830';
+  ctx.fillRect(-5, -8+bob, 10, 1);
+  // eyes stoic
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-3, -9+bob, 1, 2);
+  ctx.fillRect(2, -9+bob, 1, 2);
+  // mouth (stern line)
+  ctx.fillRect(-2, -4+bob, 4, 1);
+  // rifle
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(7, -8+bob, 2, 18);
+  ctx.fillStyle = '#1a1010';
+  ctx.fillRect(7, -10+bob, 2, 3);
+}
+
+// Queen (boss - Reine Victorienne caricaturée)
+function drawQueen(t, e) {
+  const bob = Math.sin(t*0.1 + e.phase)*1;
+  // huge dress
+  ctx.fillStyle = '#1a1010';
+  ctx.beginPath();
+  ctx.moveTo(-18, 22);
+  ctx.lineTo(-12, 0+bob);
+  ctx.lineTo(12, 0+bob);
+  ctx.lineTo(18, 22);
+  ctx.closePath(); ctx.fill();
+  // dress trim
+  ctx.fillStyle = '#3a3030';
+  ctx.fillRect(-18, 20, 36, 2);
+  ctx.fillStyle = '#f4f4f4';
+  ctx.fillRect(-18, 21, 36, 1);
+  // sash
+  ctx.fillStyle = '#1a3a8a';
+  ctx.beginPath();
+  ctx.moveTo(-10, -2+bob);
+  ctx.lineTo(10, 8+bob);
+  ctx.lineTo(8, 12+bob);
+  ctx.lineTo(-12, 2+bob);
+  ctx.closePath(); ctx.fill();
+  // bust
+  ctx.fillStyle = '#0a0506';
+  ctx.beginPath();
+  ctx.ellipse(0, -4+bob, 12, 6, 0, 0, Math.PI*2);
+  ctx.fill();
+  // arms
+  ctx.fillStyle = '#0a0506';
+  ctx.fillRect(-15, -3+bob, 4, 12);
+  ctx.fillRect(11, -3+bob, 4, 12);
+  // hands
+  ctx.fillStyle = '#f4d4b8';
+  ctx.beginPath(); ctx.arc(-13, 10+bob, 2.5, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(13, 10+bob, 2.5, 0, Math.PI*2); ctx.fill();
+  // head (pinched, stern)
+  ctx.fillStyle = '#f4d4b8';
+  ctx.beginPath(); ctx.ellipse(0, -15+bob, 9, 11, 0, 0, Math.PI*2); ctx.fill();
+  // double chin
+  ctx.beginPath(); ctx.arc(0, -7+bob, 6, 0, Math.PI); ctx.fill();
+  // hair (grey, parted, in bun)
+  ctx.fillStyle = '#cccccc';
+  ctx.beginPath(); ctx.ellipse(0, -22+bob, 10, 5, 0, Math.PI, 0); ctx.fill();
+  ctx.fillRect(-9, -19+bob, 2, 6);
+  ctx.fillRect(7, -19+bob, 2, 6);
+  // small bun
+  ctx.beginPath(); ctx.arc(0, -28+bob, 5, 0, Math.PI*2); ctx.fill();
+  // small crown
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillRect(-5, -32+bob, 10, 3);
+  for (let i=0; i<3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(-5+i*5, -32+bob);
+    ctx.lineTo(-3+i*5, -36+bob);
+    ctx.lineTo(0+i*5, -32+bob);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#c83030';
+  ctx.beginPath(); ctx.arc(0, -35+bob, 1, 0, Math.PI*2); ctx.fill();
+  // sour eyes (we are not amused)
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(-4, -17+bob, 2, 1);
+  ctx.fillRect(2, -17+bob, 2, 1);
+  // brows
+  ctx.fillRect(-5, -19+bob, 3, 1);
+  ctx.fillRect(2, -19+bob, 3, 1);
+  // pinched mouth
+  ctx.fillStyle = '#7a2020';
+  ctx.fillRect(-2, -11+bob, 4, 1);
+  // HP bar above
+  if (e.alive) {
+    const bw = 36;
+    ctx.fillStyle = '#3a1010';
+    ctx.fillRect(-bw/2, -42+bob, bw, 4);
+    ctx.fillStyle = '#e84040';
+    ctx.fillRect(-bw/2, -42+bob, bw * (e.hp/3), 4);
+    ctx.strokeStyle = '#f4d35e';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(-bw/2, -42+bob, bw, 4);
+  }
+}
+
+// --- PICKUPS ---
+function drawPickup(k, t) {
+  if (k.taken) return;
+  const float = Math.sin(t*0.1 + k.phase)*2;
+  // Glow for power-ups
+  if (['ribbon','shawl','crown'].includes(k.kind)) {
+    const glowColor = { ribbon:'#e94f64', shawl:'#1a5aa8', crown:'#f4c534' }[k.kind];
+    const pulse = (Math.sin(t*0.15+k.phase)*0.5+0.5);
+    ctx.save();
+    ctx.globalAlpha = 0.4 + pulse*0.3;
+    ctx.fillStyle = glowColor;
+    ctx.beginPath(); ctx.arc(k.x+k.w/2, k.y+k.h/2+float, 18+pulse*3, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  if (k.kind === 'tea')          drawTeacup(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'scone')   drawScone(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'ribbon')  drawRibbon(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'shawl')   drawShawl(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'crown')   drawCrown(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'lantern') drawPickupLantern(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'gear')    drawPickupGear(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'rose')    drawPickupRose(k.x+k.w/2, k.y+k.h/2+float, t);
+  else if (k.kind === 'brush')   drawPickupBrush(k.x+k.w/2, k.y+k.h/2+float, t);
+}
+
+// ---- POWER-UP SPRITES ----
+function drawRibbon(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  // ribbon trailing tails
+  ctx.fillStyle = '#c8203a';
+  ctx.beginPath();
+  ctx.moveTo(-8, 4); ctx.lineTo(-12, 10); ctx.lineTo(-6, 7); ctx.closePath(); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(8, 4); ctx.lineTo(12, 10); ctx.lineTo(6, 7); ctx.closePath(); ctx.fill();
+  // bow loops (left + right)
+  ctx.fillStyle = '#e94f64';
+  ctx.beginPath();
+  ctx.ellipse(-5, 0, 6, 4, -0.3, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(5, 0, 6, 4, 0.3, 0, Math.PI*2); ctx.fill();
+  // bow knot
+  ctx.fillStyle = '#a8203a';
+  ctx.fillRect(-2, -2, 4, 5);
+  // shine
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.beginPath(); ctx.arc(-5, -1, 1.5, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawShawl(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  const wave = Math.sin(t*0.15)*2;
+  // shawl draped (rectangle with wavy bottom)
+  ctx.fillStyle = '#1a5aa8';
+  ctx.beginPath();
+  ctx.moveTo(-9, -6);
+  ctx.lineTo(9, -6);
+  ctx.lineTo(10, 4+wave);
+  ctx.lineTo(6, 8);
+  ctx.lineTo(2, 4-wave);
+  ctx.lineTo(-2, 8);
+  ctx.lineTo(-6, 4-wave);
+  ctx.lineTo(-10, 8);
+  ctx.closePath(); ctx.fill();
+  // gold trim
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillRect(-9, -6, 18, 1.5);
+  // embroidery
+  ctx.fillStyle = '#e94f64';
+  for (let i=-7; i<=6; i+=4) {
+    ctx.beginPath(); ctx.arc(i, -2, 1, 0, Math.PI*2); ctx.fill();
+  }
+  // fringe shine
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.fillRect(-4, -5, 1, 6);
+  ctx.restore();
+}
+
+function drawCrown(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  // ring of flowers
+  const colors = ['#e94f64','#f4c534','#f4486c','#fff4d6'];
+  for (let i = 0; i < 7; i++) {
+    const a = (i/7)*Math.PI*2 + t*0.01;
+    const fx = Math.cos(a)*8, fy = Math.sin(a)*4 - 1;
+    drawFlower(fx, fy, 3.5, colors[i%colors.length], '#3a7a3a');
+  }
+  // center jewel
+  ctx.fillStyle = '#f4d35e';
+  ctx.beginPath(); ctx.arc(0, -1, 3, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#c83030';
+  ctx.beginPath(); ctx.arc(0, -1, 1.5, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.fillRect(-1, -3, 1, 1);
+  ctx.restore();
+}
+
+function drawTeacup(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  // saucer
+  ctx.fillStyle = '#f4e8d4';
+  ctx.beginPath(); ctx.ellipse(0, 6, 10, 2, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#c8a830';
+  ctx.fillRect(-10, 6, 20, 1);
+  // cup body
+  ctx.fillStyle = '#f4e8d4';
+  ctx.fillRect(-6, -2, 12, 7);
+  ctx.beginPath(); ctx.ellipse(0, 5, 6, 1, 0, 0, Math.PI*2); ctx.fill();
+  // top opening (tea)
+  ctx.fillStyle = '#5a3010';
+  ctx.beginPath(); ctx.ellipse(0, -2, 6, 1.5, 0, 0, Math.PI*2); ctx.fill();
+  // handle
+  ctx.strokeStyle = '#f4e8d4';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(7, 1, 3, -Math.PI/2, Math.PI/2); ctx.stroke();
+  // gold rim
+  ctx.fillStyle = '#c8a830';
+  ctx.fillRect(-6, -2, 12, 1);
+  // steam
+  ctx.strokeStyle = `rgba(255,255,255,${0.4+Math.sin(t*0.1)*0.2})`;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.moveTo(-2, -3);
+  ctx.quadraticCurveTo(-4 + Math.sin(t*0.1)*2, -7, 0, -10);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(2, -3);
+  ctx.quadraticCurveTo(4 + Math.sin(t*0.1+1)*2, -7, 1, -10);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawScone(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  // scone base
+  ctx.fillStyle = '#d4a868';
+  ctx.beginPath();
+  ctx.ellipse(0, 4, 10, 4, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#c89858';
+  ctx.fillRect(-10, 0, 20, 4);
+  ctx.beginPath();
+  ctx.arc(0, 0, 10, Math.PI, 0);
+  ctx.fill();
+  // jam
+  ctx.fillStyle = '#c82040';
+  ctx.beginPath(); ctx.arc(-3, -1, 4, Math.PI, 0); ctx.fill();
+  ctx.beginPath(); ctx.arc(4, -2, 3, Math.PI, 0); ctx.fill();
+  // cream
+  ctx.fillStyle = '#f4e8d4';
+  ctx.beginPath(); ctx.arc(0, -4, 5, Math.PI, 0); ctx.fill();
+  ctx.beginPath(); ctx.arc(-2, -6, 3, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(3, -7, 3, 0, Math.PI*2); ctx.fill();
+  // sparkle
+  ctx.fillStyle = `rgba(255,255,255,${0.5+Math.sin(t*0.2)*0.4})`;
+  ctx.fillRect(6, -8, 2, 2);
+  ctx.fillRect(-7, -5, 2, 2);
+  ctx.restore();
+}
+
+// ----------------------------------------------------------------------------
+//  CHATTER bubble above enemies
+// ----------------------------------------------------------------------------
+function drawChatter(e) {
+  const cx = e.x + e.w/2;
+  const cy = e.y - 10;
+  const txt = e.chatter.text;
+  ctx.save();
+  ctx.font = 'bold 11px Georgia';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = ctx.measureText(txt).width + 12;
+  const fade = Math.min(1, e.chatter.life / 30);
+  ctx.globalAlpha = fade;
+  // bubble background
+  ctx.fillStyle = '#f4e6c8';
+  ctx.strokeStyle = '#3a2010';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.roundRect ? ctx.roundRect(cx-w/2, cy-12, w, 18, 4) : ctx.rect(cx-w/2, cy-12, w, 18);
+  ctx.fill(); ctx.stroke();
+  // tail
+  ctx.beginPath();
+  ctx.moveTo(cx-4, cy+5); ctx.lineTo(cx, cy+12); ctx.lineTo(cx+4, cy+5);
+  ctx.closePath(); ctx.fillStyle = '#f4e6c8'; ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx-4, cy+5); ctx.lineTo(cx, cy+12); ctx.lineTo(cx+4, cy+5);
+  ctx.strokeStyle = '#3a2010'; ctx.stroke();
+  // text
+  ctx.fillStyle = '#3a2010';
+  ctx.fillText(txt, cx, cy-3);
+  ctx.restore();
+}
+
+// ----------------------------------------------------------------------------
+//  PARTICLES RENDER
+// ----------------------------------------------------------------------------
+function drawParticles() {
+  for (const p of game.particles) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p.life / 40);
+    ctx.fillStyle = p.color;
+    if (p.rot !== undefined) {
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillRect(-p.size/2, -p.size/2, p.size, p.size*1.5);
+    } else {
+      ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+    }
+    ctx.restore();
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  HUD
+// ----------------------------------------------------------------------------
+function drawHUD() {
+  // ornate frame top
+  ctx.fillStyle = 'rgba(20, 10, 25, 0.78)';
+  ctx.fillRect(0, 0, W, 44);
+  ctx.fillStyle = '#c9a96e';
+  ctx.fillRect(0, 42, W, 2);
+
+  ctx.textBaseline = 'middle';
+
+  // ==== Score (left) ====
+  ctx.font = 'bold 18px Georgia';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText(`SCORE  ${game.score.toString().padStart(5,'0')}`, 14, 22);
+
+  // ==== Teas counter (left-center) with mini teacup icon ====
+  drawMiniTeacup(180, 22);
+  ctx.font = 'bold 18px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText(`× ${game.totalCoins}`, 196, 22);
+  // progress to next +1up (every 10)
+  const remainder = game.totalCoins % 10;
+  ctx.font = '11px Georgia';
+  ctx.fillStyle = '#aaa9a0';
+  ctx.fillText(`${remainder}/10`, 240, 30);
+
+  // ==== Lives (mini Frida heads) ====
+  ctx.font = 'bold 16px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText('×', 280, 22);
+  for (let i = 0; i < Math.min(game.lives, 6); i++) {
+    drawTinyFrida(305 + i*22, 22);
+  }
+  if (game.lives > 6) {
+    ctx.fillStyle = '#f4e6c8';
+    ctx.fillText('+' + (game.lives - 6), 305 + 6*22, 22);
+  }
+
+  // ==== Level name (center) ====
+  ctx.textAlign = 'center';
+  ctx.font = 'italic 16px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText(`— ${game.level.name} —`, W/2, 22);
+
+  // ==== Acte X/N (top right) ====
+  ctx.textAlign = 'right';
+  ctx.font = 'bold 14px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText(`Acte ${game.levelIdx+1} / ${LEVELS.length}`, W-14, 22);
+
+  // ==== Power-up timers (just below HUD bar, right side) ====
+  const p = game.player;
+  let py = 56;
+  function drawPowerTimer(kind, frames, label, color) {
+    if (frames <= 0) return;
+    const total = POWER_DURATIONS[kind];
+    const frac = frames / total;
+    const x = W - 180;
+    // bg bar
+    ctx.fillStyle = 'rgba(20,10,25,0.85)';
+    ctx.fillRect(x, py-12, 170, 22);
+    // mini sprite
+    ctx.save();
+    if (kind === 'ribbon') drawRibbon(x+14, py-1, game.time);
+    else if (kind === 'shawl') drawShawl(x+14, py-1, game.time);
+    else if (kind === 'crown') drawCrown(x+14, py-1, game.time);
+    ctx.restore();
+    // label + bar
+    ctx.font = 'bold 12px Georgia';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.fillText(label, x+30, py-3);
+    // timer bar
+    ctx.fillStyle = '#332533';
+    ctx.fillRect(x+30, py+4, 130, 5);
+    ctx.fillStyle = color;
+    ctx.fillRect(x+30, py+4, 130*frac, 5);
+    py += 26;
+  }
+  if (p) {
+    drawPowerTimer('ribbon', p.powerDoubleJump, 'RUBAN — Double saut', '#e94f64');
+    drawPowerTimer('shawl',  p.powerSprint,    'CHÂLE — Sprint',       '#5a8ace');
+    drawPowerTimer('crown',  p.powerInvinc,    'COURONNE — Invincible', '#f4d35e');
+  }
+}
+
+function drawMiniTeacup(cx, cy) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.fillStyle = '#f4e8d4';
+  ctx.fillRect(-5, -3, 10, 7);
+  ctx.beginPath(); ctx.ellipse(0, 4, 5, 1, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#5a3010';
+  ctx.beginPath(); ctx.ellipse(0, -3, 5, 1.2, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#c8a830';
+  ctx.fillRect(-5, -3, 10, 1);
+  ctx.strokeStyle = '#f4e8d4';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(6, 0, 2.5, -Math.PI/2, Math.PI/2); ctx.stroke();
+  ctx.restore();
+}
+
+function drawTinyFrida(cx, cy) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  // head
+  ctx.fillStyle = '#b87858';
+  ctx.beginPath(); ctx.arc(0, 1, 8, 0, Math.PI*2); ctx.fill();
+  // hair
+  ctx.fillStyle = '#1a0e0a';
+  ctx.beginPath(); ctx.ellipse(0, -3, 9, 5, 0, Math.PI, 0); ctx.fill();
+  // flower
+  drawFlower(-4, -4, 2.5, '#f4486c', '#f4d35e');
+  drawFlower(4, -4, 2, '#f4c534', '#c83030');
+  // unibrow
+  ctx.fillStyle = '#0a0500';
+  ctx.fillRect(-5, -2, 10, 1.5);
+  // eyes
+  ctx.fillRect(-3, 0, 1.5, 1.5);
+  ctx.fillRect(2, 0, 1.5, 1.5);
+  // lips
+  ctx.fillStyle = '#a8203a';
+  ctx.fillRect(-2, 4, 4, 1);
+  ctx.restore();
+}
+
+// ----------------------------------------------------------------------------
+//  SCREENS
+// ----------------------------------------------------------------------------
+function drawTitle(t) {
+  drawLondonBG(t);
+
+  // Darken
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Decorative frame
+  ctx.strokeStyle = '#c9a96e';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(40, 40, W-80, H-80);
+  ctx.strokeRect(48, 48, W-96, H-96);
+
+  ctx.textAlign = 'center';
+
+  // Frida portrait
+  ctx.save();
+  ctx.translate(W/2, 200);
+  ctx.scale(3, 3);
+  const fakeP = { x:-11, y:-15, w:22, h:30, facing:1, walkPhase:0, onGround:true, invuln:0 };
+  drawFrida(fakeP, t);
+  ctx.restore();
+
+  ctx.font = 'bold 56px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText('FRIDA À LONDRES', W/2, 340);
+  ctx.font = 'italic 24px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText("L'Odyssée Victorienne", W/2, 370);
+
+  ctx.font = 'bold 22px Georgia';
+  const blink = Math.sin(t*0.1) > 0;
+  ctx.fillStyle = blink ? '#f4e6c8' : '#c9a96e';
+  ctx.fillText('▶ Appuyez sur ESPACE pour commencer ◀', W/2, 440);
+
+  ctx.font = '14px Georgia';
+  ctx.fillStyle = '#aaa9a0';
+  ctx.fillText('Un plateformer en quatre actes — Cobblestones, charbon, lande, couronne', W/2, 480);
+}
+
+// ============================================================================
+//  FRIDA QUOTES (one shown per intermission - keyed to the level just finished)
+// ============================================================================
+const FRIDA_QUOTES = [
+  { q: "« Des pieds, pour quoi faire si j'ai des ailes pour voler ? »",
+    src: "— Frida Kahlo" },
+  { q: "« Je ne peins pas mes rêves ni mes cauchemars. Je peins ma propre réalité. »",
+    src: "— Frida Kahlo" },
+  { q: "« Au bout du compte, on peut toujours résister. »",
+    src: "— Frida Kahlo" },
+  { q: "« Rien n'est absolu. Tout change, tout bouge, tout tourne, tout vole et s'en va. »",
+    src: "— Frida Kahlo" },
+];
+
+function drawIntermission(t) {
+  // Atmospheric BG: London at dusk with floating particles
+  drawLondonBG(t);
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Parchment-like card
+  const cardX = 80, cardY = 70, cardW = W-160, cardH = H-140;
+  ctx.fillStyle = 'rgba(244,230,200,0.97)';
+  ctx.fillRect(cardX, cardY, cardW, cardH);
+  ctx.strokeStyle = '#3a2010';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(cardX, cardY, cardW, cardH);
+  ctx.strokeStyle = '#c9a96e';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(cardX+6, cardY+6, cardW-12, cardH-12);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#3a2010';
+  ctx.font = 'italic 16px Georgia';
+  ctx.fillText('— Acte achevé —', W/2, cardY+34);
+
+  ctx.font = 'bold 36px Georgia';
+  ctx.fillText(`Bravo, Frida !`, W/2, cardY+78);
+
+  ctx.font = 'italic 18px Georgia';
+  ctx.fillText(`Tu as traversé "${LEVELS[game.levelIdx].name}"`, W/2, cardY+108);
+
+  // Frida quote (changes per level)
+  const quote = FRIDA_QUOTES[game.levelIdx % FRIDA_QUOTES.length];
+  ctx.font = 'italic 17px Georgia';
+  ctx.fillStyle = '#5a3010';
+  // Wrap manually if needed
+  wrapText(quote.q, W/2, cardY+158, cardW-80, 24);
+  ctx.font = 'bold 14px Georgia';
+  ctx.fillStyle = '#7a1818';
+  ctx.fillText(quote.src, W/2, cardY+220);
+
+  // Decorative flowers
+  drawFlower(cardX+30, cardY+30, 6, '#e94f64', '#f4d35e');
+  drawFlower(cardX+cardW-30, cardY+30, 6, '#f4c534', '#c83030');
+  drawFlower(cardX+30, cardY+cardH-30, 6, '#f4486c', '#fff4d6');
+  drawFlower(cardX+cardW-30, cardY+cardH-30, 6, '#1a5aa8', '#f4d35e');
+
+  // Next act preview
+  const next = LEVELS[game.levelIdx + 1];
+  if (next) {
+    ctx.font = '14px Georgia';
+    ctx.fillStyle = '#3a2010';
+    ctx.fillText(`Prochain acte`, W/2, cardY+260);
+    ctx.font = 'bold 22px Georgia';
+    ctx.fillStyle = '#1a3a8a';
+    ctx.fillText(`« ${next.name} »`, W/2, cardY+288);
+    ctx.font = 'italic 14px Georgia';
+    ctx.fillStyle = '#5a3010';
+    ctx.fillText(next.subtitle, W/2, cardY+310);
+  }
+
+  // Stats line
+  ctx.font = 'bold 14px Georgia';
+  ctx.fillStyle = '#3a2010';
+  ctx.fillText(`Théières bues : ${game.totalCoins}    Vies : ${game.lives}    Score : ${game.score}`, W/2, cardY+cardH-50);
+
+  ctx.font = 'bold 18px Georgia';
+  ctx.fillStyle = '#7a1818';
+  const blink = Math.sin(t*0.15) > 0;
+  if (blink) ctx.fillText('▶ ESPACE pour continuer ◀', W/2, cardY+cardH-22);
+}
+
+function wrapText(text, x, y, maxW, lineH) {
+  const words = text.split(' ');
+  let line = '', yy = y;
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW) {
+      ctx.fillText(line, x, yy);
+      yy += lineH;
+      line = w;
+    } else line = test;
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+
+function drawWinScreen(t) {
+  drawBigBenBG(t);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  ctx.fillRect(0, 0, W, H);
+
+  // confetti
+  for (let i=0;i<60;i++) {
+    const cx = (i*97 + t*2) % W;
+    const cy = (i*53 + t*3) % H;
+    ctx.fillStyle = ['#f4d35e','#c83030','#1a5aa8','#f4486c','#3a7a3a'][i%5];
+    ctx.fillRect(cx, cy, 4, 6);
+  }
+
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 64px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText('VIVE FRIDA !', W/2, 200);
+  ctx.font = 'italic 24px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText("La Reine est terrassée. L'Empire vacille.", W/2, 240);
+  ctx.fillText("Frida rentre au Mexique en sirotant son thé.", W/2, 270);
+
+  ctx.font = 'bold 28px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText(`Score final : ${game.score}`, W/2, 350);
+  ctx.font = '20px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText(`Tasses de thé bues : ${game.totalCoins}`, W/2, 385);
+
+  ctx.font = 'bold 20px Georgia';
+  const blink = Math.sin(t*0.12) > 0;
+  ctx.fillStyle = blink ? '#f4e6c8' : '#c9a96e';
+  ctx.fillText('Appuyez sur ESPACE pour rejouer', W/2, 470);
+}
+
+function drawGameOver(t) {
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(0, 0, W, H);
+  // dripping
+  ctx.fillStyle = '#3a0a0a';
+  for (let i=0; i<20; i++) {
+    const x = (i*49) % W;
+    ctx.fillRect(x, 0, 8, 30 + (i*7)%80);
+  }
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 72px Georgia';
+  ctx.fillStyle = '#c83030';
+  ctx.fillText('GAME OVER', W/2, 220);
+  ctx.font = 'italic 22px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText("Frida est rentrée chez elle... pour préparer sa revanche.", W/2, 270);
+  ctx.font = 'bold 20px Georgia';
+  const blink = Math.sin(t*0.12) > 0;
+  ctx.fillStyle = blink ? '#f4e6c8' : '#7a1818';
+  ctx.fillText('Appuyez sur ESPACE pour recommencer', W/2, 380);
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 60px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText('PAUSE', W/2, H/2);
+  ctx.font = '20px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText('Appuyez sur P pour reprendre', W/2, H/2 + 40);
+}
+
+// ----------------------------------------------------------------------------
+//  MAIN LOOP
+// ----------------------------------------------------------------------------
+function update() {
+  game.time++;
+
+  if (game.state === 'title') {
+    if (consume('Space')) {
+      ensureAudio();
+      game.score = 0; game.lives = 3; game.totalCoins = 0;
+      game.qaIdx = 0; game.qaAnswered = -1; game.qaPhase = 'asking';
+      game.state = 'fridaQA';
+    }
+    return;
+  }
+  if (game.state === 'intermission') {
+    game.intermissionTimer++;
+    if (consume('Space') && game.intermissionTimer > 30) {
+      game.qaIdx = game.levelIdx + 1;
+      game.qaAnswered = -1; game.qaPhase = 'asking';
+      game.state = 'fridaQA';
+    }
+    return;
+  }
+  if (game.state === 'fridaQA') {
+    const q = FRIDA_QUESTIONS[game.qaIdx];
+    if (!q) { game.state = 'powerSelect'; return; }
+    if (game.qaPhase === 'asking') {
+      let pick = -1;
+      if (consume('Digit1') || consume('Numpad1')) pick = 0;
+      else if (consume('Digit2') || consume('Numpad2')) pick = 1;
+      else if (consume('Digit3') || consume('Numpad3')) pick = 2;
+      if (pick >= 0) {
+        game.qaAnswered = pick;
+        game.qaPhase = 'reply';
+        if (q.answers[pick].correct) { game.score += 50; game.flashGold = 30; SFX.coin(); }
+        else { SFX.hit(); }
+      }
+    } else if (game.qaPhase === 'reply') {
+      if (consume('Space')) {
+        rollPowerChoices();
+        game.state = 'powerSelect';
+      }
+    }
+    return;
+  }
+  if (game.state === 'powerSelect') {
+    if (!game.powerChoicesForLevel || game.powerChoicesForLevel.length === 0) rollPowerChoices();
+    let pick = -1;
+    if (consume('Digit1') || consume('Numpad1')) pick = 0;
+    else if (consume('Digit2') || consume('Numpad2')) pick = 1;
+    else if (consume('Digit3') || consume('Numpad3')) pick = 2;
+    if (pick >= 0) {
+      game.selectedPower = game.powerChoicesForLevel[pick].kind;
+      SFX.win();
+      loadLevel(game.qaIdx);
+    }
+    return;
+  }
+  if (game.state === 'win') {
+    if (consume('Space')) {
+      game.state = 'title';
+    }
+    return;
+  }
+  if (game.state === 'gameover') {
+    if (consume('Space')) {
+      game.state = 'title';
+    }
+    return;
+  }
+  if (game.state === 'paused') {
+    if (consume('KeyP')) game.state = 'playing';
+    return;
+  }
+  if (game.state !== 'playing') return;
+
+  if (consume('KeyP')) { game.state = 'paused'; return; }
+  if (consume('KeyR')) { loadLevel(game.levelIdx); return; }
+
+  updatePlayer();
+  // Slow-mo halves enemy update tick rate
+  const slowmoActive = game.player && game.player.powerSlowmo > 0;
+  if (!slowmoActive || (game.time % 2 === 0)) {
+    for (const e of game.enemies) { updateEnemy(e, game.level); if (e.alive) maybeChatter(e); }
+  }
+  // Projectiles
+  if (game.projectiles && game.projectiles.length) {
+    for (let i = game.projectiles.length - 1; i >= 0; i--) {
+      const pr = game.projectiles[i];
+      pr.x += pr.vx;
+      pr.y += pr.vy;
+      pr.vy += 0.15;
+      pr.life--;
+      // Hit any enemy?
+      for (const e of game.enemies) {
+        if (!e.alive) continue;
+        if (pr.x > e.x && pr.x < e.x + e.w && pr.y > e.y && pr.y < e.y + e.h) {
+          if (e.isBoss) {
+            e.hp--;
+            if (e.hp <= 0) {
+              e.alive = false; game.bossKilled = true;
+              game.score += 1000; SFX.win();
+              spawnPetals(e.x+e.w/2, e.y+e.h/2);
+              pushNotif({ iconKind:'fire', title:'BOSS BRÛLÉ', desc:'Tu as réduit la Reine en cendres !', color:'#ff6622' });
+            } else {
+              spawnPuff(e.x+e.w/2, e.y, '#ffaa44');
+            }
+          } else {
+            e.alive = false;
+            game.score += 100; SFX.stomp();
+            spawnPuff(e.x+e.w/2, e.y+e.h/2, '#ffaa44');
+          }
+          pr.life = 0;
+          break;
+        }
+      }
+      // Hit a solid tile? Stop
+      const tx = Math.floor(pr.x / TILE);
+      const ty = Math.floor(pr.y / TILE);
+      if (ty >= 0 && ty < game.level.h && tx >= 0 && tx < game.level.w) {
+        const c = game.level.grid[ty][tx];
+        if (SOLIDS.has(c)) pr.life = 0;
+      }
+      if (pr.life <= 0) game.projectiles.splice(i, 1);
+    }
+  }
+  updateParticles();
+  updateFloatTexts();
+  updateNotifications();
+  // cleanup dead enemies after fade
+  game.enemies = game.enemies.filter(e => e.alive || e.deathTimer < 40);
+
+  updateCamera();
+
+  if (game.shake > 0) game.shake--;
+  if (game.flashRed > 0) game.flashRed--;
+  if (game.flashGold > 0) game.flashGold--;
+}
+
+function render() {
+  ctx.save();
+  if (game.state === 'playing' && game.shake > 0) {
+    ctx.translate((Math.random()-0.5)*game.shake, (Math.random()-0.5)*game.shake);
+  }
+
+  if (game.state === 'title') {
+    drawTitle(game.time);
+    ctx.restore();
+    return;
+  }
+  if (game.state === 'win') {
+    drawWinScreen(game.time);
+    ctx.restore();
+    return;
+  }
+  if (game.state === 'gameover') {
+    drawGameOver(game.time);
+    ctx.restore();
+    return;
+  }
+  if (game.state === 'intermission') {
+    drawIntermission(game.time);
+    ctx.restore();
+    return;
+  }
+  if (game.state === 'fridaQA') {
+    drawFridaQA(game.time);
+    ctx.restore();
+    return;
+  }
+  if (game.state === 'powerSelect') {
+    drawPowerSelect(game.time);
+    ctx.restore();
+    return;
+  }
+
+  // Playing / paused
+  if (!game.level) { ctx.restore(); return; }
+  drawBackground(game.level.theme, game.time);
+
+  ctx.save();
+  ctx.translate(-Math.floor(game.camera.x), -Math.floor(game.camera.y));
+
+  drawTiles(game.level, game.time);
+
+  // Pickups
+  for (const k of game.pickups) drawPickup(k, game.time);
+
+  // Enemies (+ chatter bubbles)
+  for (const e of game.enemies) {
+    drawEnemy(e, game.time);
+    if (e.alive && e.chatter && e.chatter.life > 0) drawChatter(e);
+  }
+
+  // Player
+  if (game.player) drawFrida(game.player, game.time);
+
+  // Particles (in world space)
+  drawParticles();
+
+  // Float texts (world space)
+  drawFloatTexts();
+
+  ctx.restore();
+
+  // Flash overlays
+  if (game.flashRed > 0) {
+    ctx.fillStyle = `rgba(255, 30, 30, ${game.flashRed/40})`;
+    ctx.fillRect(0,0,W,H);
+  }
+  if (game.flashGold > 0) {
+    ctx.fillStyle = `rgba(255, 220, 80, ${game.flashGold/60})`;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  drawHUD();
+  drawNotifications();
+
+  if (game.state === 'paused') drawPause();
+
+  ctx.restore();
+}
+
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// boot
+loop();
+
+</script>
+</body>
+</html>
+.flashGold/60})`;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  drawHUD();
+  drawNotifications();
+
+  if (game.state === 'paused') drawPause();
+
+  ctx.restore();
+}
+
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// boot
+loop();
+
+</script>
+</body>
+</html>
+
+
+const FRIDA_QUOTES = [
+  { q: "« Des pieds, pour quoi faire si j'ai des ailes pour voler ? »", src: "— Frida Kahlo" },
+  { q: "« Je ne peins pas mes rêves ni mes cauchemars. Je peins ma propre réalité. »", src: "— Frida Kahlo" },
+  { q: "« Au bout du compte, on peut toujours résister. »", src: "— Frida Kahlo" },
+  { q: "« Rien n'est absolu. Tout change, tout bouge, tout tourne, tout vole et s'en va. »", src: "— Frida Kahlo" },
+];
+
+function wrapText(text, x, y, maxW, lineH) {
+  const words = text.split(' ');
+  let line = '', yy = y;
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW) { ctx.fillText(line, x, yy); yy += lineH; line = w; }
+    else line = test;
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+
+function drawTitle(t) {
+  drawLondonBG(t);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = '#c9a96e'; ctx.lineWidth = 3;
+  ctx.strokeRect(40, 40, W-80, H-80);
+  ctx.strokeRect(48, 48, W-96, H-96);
+  ctx.textAlign = 'center';
+  ctx.save(); ctx.translate(W/2, 200); ctx.scale(3, 3);
+  const fakeP = { x:-11, y:-15, w:22, h:30, facing:1, walkPhase:0, onGround:true,
+                  invuln:0, powerSprint:0, powerInvinc:0, powerDoubleJump:0,
+                  powerFireball:0, powerFly:0, powerMagnet:0, powerSlowmo:0,
+                  powerScoreBoost:0, powerGroundpound:0, powerBrush:0, hairFlow:t*0.15 };
+  drawFrida(fakeP, t);
+  ctx.restore();
+  ctx.font = 'bold 56px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText('FRIDA À LONDRES', W/2, 340);
+  ctx.font = 'italic 24px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText("L'Odyssée Victorienne", W/2, 370);
+  ctx.font = 'bold 22px Georgia';
+  const blink = Math.sin(t*0.1) > 0;
+  ctx.fillStyle = blink ? '#f4e6c8' : '#c9a96e';
+  ctx.fillText('▶ ESPACE pour commencer ◀', W/2, 440);
+  ctx.font = '13px Georgia';
+  ctx.fillStyle = '#aaa9a0';
+  ctx.fillText('Pavés • Charbon • Lande • Couronne — 10 pouvoirs, 3 par niveau', W/2, 478);
+}
+
+function drawIntermission(t) {
+  drawLondonBG(t);
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, W, H);
+  const cardX = 80, cardY = 70, cardW = W-160, cardH = H-140;
+  ctx.fillStyle = 'rgba(244,230,200,0.97)';
+  ctx.fillRect(cardX, cardY, cardW, cardH);
+  ctx.strokeStyle = '#3a2010'; ctx.lineWidth = 3;
+  ctx.strokeRect(cardX, cardY, cardW, cardH);
+  ctx.strokeStyle = '#c9a96e'; ctx.lineWidth = 1;
+  ctx.strokeRect(cardX+6, cardY+6, cardW-12, cardH-12);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#3a2010';
+  ctx.font = 'italic 16px Georgia';
+  ctx.fillText('— Acte achevé —', W/2, cardY+34);
+  ctx.font = 'bold 36px Georgia';
+  ctx.fillText(`Bravo, Frida !`, W/2, cardY+78);
+  ctx.font = 'italic 18px Georgia';
+  ctx.fillText(`Tu as traversé "${LEVELS[game.levelIdx].name}"`, W/2, cardY+108);
+  const quote = FRIDA_QUOTES[game.levelIdx % FRIDA_QUOTES.length];
+  ctx.font = 'italic 17px Georgia';
+  ctx.fillStyle = '#5a3010';
+  ctx.textAlign = 'center';
+  wrapText(quote.q, W/2, cardY+158, cardW-80, 24);
+  ctx.font = 'bold 14px Georgia';
+  ctx.fillStyle = '#7a1818';
+  ctx.fillText(quote.src, W/2, cardY+218);
+  drawFlower(cardX+30, cardY+30, 6, '#e94f64', '#f4d35e');
+  drawFlower(cardX+cardW-30, cardY+30, 6, '#f4c534', '#c83030');
+  drawFlower(cardX+30, cardY+cardH-30, 6, '#f4486c', '#fff4d6');
+  drawFlower(cardX+cardW-30, cardY+cardH-30, 6, '#1a5aa8', '#f4d35e');
+  ctx.font = 'bold 14px Georgia';
+  ctx.fillStyle = '#3a2010';
+  const themeKind = LEVEL_THEME_OBJECT[game.levelIdx];
+  let statsLine = `Théières : ${game.totalCoins}    Vies : ${game.lives}    Score : ${game.score}`;
+  if (themeKind) {
+    const tCount = game.collected[themeKind] || 0;
+    const objVal = OBJECTIVES[themeKind];
+    const label = { lantern:'Lanternes', gear:'Engrenages', rose:'Roses', brush:'Pinceaux' }[themeKind];
+    statsLine += `    ${label} : ${tCount}/${objVal}`;
+  }
+  ctx.fillText(statsLine, W/2, cardY+cardH-80);
+  ctx.font = 'bold 18px Georgia';
+  ctx.fillStyle = '#7a1818';
+  const blink = Math.sin(t*0.15) > 0;
+  if (blink) ctx.fillText('▶ ESPACE pour continuer ◀', W/2, cardY+cardH-22);
+}
+
+function drawWinScreen(t) {
+  drawBigBenBG(t);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  ctx.fillRect(0, 0, W, H);
+  for (let i=0;i<60;i++) {
+    const cx = (i*97 + t*2) % W;
+    const cy = (i*53 + t*3) % H;
+    ctx.fillStyle = ['#f4d35e','#c83030','#1a5aa8','#f4486c','#3a7a3a'][i%5];
+    ctx.fillRect(cx, cy, 4, 6);
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 64px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText('VIVE FRIDA !', W/2, 200);
+  ctx.font = 'italic 24px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText("La Reine est terrassée. L'Empire vacille.", W/2, 240);
+  ctx.fillText("Frida rentre au Mexique en sirotant son thé.", W/2, 270);
+  ctx.font = 'bold 28px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText(`Score final : ${game.score}`, W/2, 350);
+  ctx.font = '20px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText(`Théières bues : ${game.totalCoins}`, W/2, 385);
+  ctx.font = 'bold 20px Georgia';
+  const blink = Math.sin(t*0.12) > 0;
+  ctx.fillStyle = blink ? '#f4e6c8' : '#c9a96e';
+  ctx.fillText('ESPACE pour rejouer', W/2, 470);
+}
+
+function drawGameOver(t) {
+  ctx.fillStyle = '#1a0a0a';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#3a0a0a';
+  for (let i=0; i<20; i++) {
+    const x = (i*49) % W;
+    ctx.fillRect(x, 0, 8, 30 + (i*7)%80);
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 72px Georgia';
+  ctx.fillStyle = '#c83030';
+  ctx.fillText('GAME OVER', W/2, 220);
+  ctx.font = 'italic 22px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText("Frida est rentrée chez elle... pour préparer sa revanche.", W/2, 270);
+  ctx.font = 'bold 20px Georgia';
+  const blink = Math.sin(t*0.12) > 0;
+  ctx.fillStyle = blink ? '#f4e6c8' : '#7a1818';
+  ctx.fillText('ESPACE pour recommencer', W/2, 380);
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 60px Georgia';
+  ctx.fillStyle = '#f4d35e';
+  ctx.fillText('PAUSE', W/2, H/2);
+  ctx.font = '20px Georgia';
+  ctx.fillStyle = '#f4e6c8';
+  ctx.fillText('P pour reprendre', W/2, H/2 + 40);
+}
+
+function update() {
+  game.time++;
+  if (game.state === 'title') {
+    if (consume('Space')) {
+      ensureAudio();
+      game.score = 0; game.lives = 3; game.totalCoins = 0;
+      game.qaIdx = 0; game.qaAnswered = -1; game.qaPhase = 'asking';
+      game.state = 'fridaQA';
+    }
+    return;
+  }
+  if (game.state === 'intermission') {
+    game.intermissionTimer++;
+    if (consume('Space') && game.intermissionTimer > 30) {
+      game.qaIdx = game.levelIdx + 1;
+      game.qaAnswered = -1; game.qaPhase = 'asking';
+      game.state = 'fridaQA';
+    }
+    return;
+  }
+  if (game.state === 'fridaQA') {
+    const q = FRIDA_QUESTIONS[game.qaIdx];
+    if (!q) { rollPowerChoices(); game.state = 'powerSelect'; return; }
+    if (game.qaPhase === 'asking') {
+      let pick = -1;
+      if (consume('Digit1') || consume('Numpad1')) pick = 0;
+      else if (consume('Digit2') || consume('Numpad2')) pick = 1;
+      else if (consume('Digit3') || consume('Numpad3')) pick = 2;
+      if (pick >= 0) {
+        game.qaAnswered = pick;
+        game.qaPhase = 'reply';
+        if (q.answers[pick].correct) { game.score += 50; game.flashGold = 30; SFX.coin(); }
+        else { SFX.hit(); }
+      }
+    } else if (game.qaPhase === 'reply') {
+      if (consume('Space')) { rollPowerChoices(); game.state = 'powerSelect'; }
+    }
+    return;
+  }
+  if (game.state === 'powerSelect') {
+    if (!game.powerChoicesForLevel || game.powerChoicesForLevel.length === 0) rollPowerChoices();
+    let pick = -1;
+    if (consume('Digit1') || consume('Numpad1')) pick = 0;
+    else if (consume('Digit2') || consume('Numpad2')) pick = 1;
+    else if (consume('Digit3') || consume('Numpad3')) pick = 2;
+    if (pick >= 0) {
+      game.selectedPower = game.powerChoicesForLevel[pick].kind;
+      SFX.win();
+      loadLevel(game.qaIdx);
+    }
+    return;
+  }
+  if (game.state === 'win') { if (consume('Space')) game.state = 'title'; return; }
+  if (game.state === 'gameover') { if (consume('Space')) game.state = 'title'; return; }
+  if (game.state === 'paused') { if (consume('KeyP')) game.state = 'playing'; return; }
+  if (game.state !== 'playing') return;
+  if (consume('KeyP')) { game.state = 'paused'; return; }
+  if (consume('KeyR')) { loadLevel(game.levelIdx); return; }
+  updatePlayer();
+  const slowmoActive = game.player && game.player.powerSlowmo > 0;
+  if (!slowmoActive || (game.time % 2 === 0)) {
+    for (const e of game.enemies) { updateEnemy(e, game.level); if (e.alive) maybeChatter(e); }
+  }
+  // Projectiles
+  if (game.projectiles && game.projectiles.length) {
+    for (let i = game.projectiles.length - 1; i >= 0; i--) {
+      const pr = game.projectiles[i];
+      pr.x += pr.vx;
+      pr.y += pr.vy;
+      pr.vy += 0.15;
+      pr.life--;
+      for (const e of game.enemies) {
+        if (!e.alive) continue;
+        if (pr.x > e.x && pr.x < e.x + e.w && pr.y > e.y && pr.y < e.y + e.h) {
+          if (e.isBoss) {
+            e.hp--;
+            if (e.hp <= 0) {
+              e.alive = false; game.bossKilled = true;
+              game.score += 1000; SFX.win();
+              spawnPetals(e.x+e.w/2, e.y+e.h/2);
+              pushNotif({ iconKind:'fire', title:'BOSS BRÛLÉ', desc:'Tu as réduit la Reine en cendres !', color:'#ff6622' });
+            } else spawnPuff(e.x+e.w/2, e.y, '#ffaa44');
+          } else {
+            e.alive = false;
+            game.score += 100; SFX.stomp();
+            spawnPuff(e.x+e.w/2, e.y+e.h/2, '#ffaa44');
+          }
+          pr.life = 0; break;
+        }
+      }
+      const tx = Math.floor(pr.x / TILE);
+      const ty = Math.floor(pr.y / TILE);
+      if (ty >= 0 && ty < game.level.h && tx >= 0 && tx < game.level.w) {
+        const c = game.level.grid[ty][tx];
+        if (SOLIDS.has(c)) pr.life = 0;
+      }
+      if (pr.life <= 0) game.projectiles.splice(i, 1);
+    }
+  }
+  updateParticles();
+  updateFloatTexts();
+  updateNotifications();
+  game.enemies = game.enemies.filter(e => e.alive || e.deathTimer < 40);
+  updateCamera();
+  if (game.shake > 0) game.shake--;
+  if (game.flashRed > 0) game.flashRed--;
+  if (game.flashGold > 0) game.flashGold--;
+  const anyDecor = game.decorTriggered.lantern || game.decorTriggered.gear ||
+                   game.decorTriggered.rose || game.decorTriggered.brush;
+  if (anyDecor && game.decorTransition < 60) game.decorTransition++;
+  if (game.messageTimer > 0) game.messageTimer--;
+}
+
+function render() {
+  ctx.save();
+  if (game.state === 'playing' && game.shake > 0) {
+    ctx.translate((Math.random()-0.5)*game.shake, (Math.random()-0.5)*game.shake);
+  }
+  if (game.state === 'title')        { drawTitle(game.time);        ctx.restore(); return; }
+  if (game.state === 'win')          { drawWinScreen(game.time);    ctx.restore(); return; }
+  if (game.state === 'gameover')     { drawGameOver(game.time);     ctx.restore(); return; }
+  if (game.state === 'intermission') { drawIntermission(game.time); ctx.restore(); return; }
+  if (game.state === 'fridaQA')      { drawFridaQA(game.time);      ctx.restore(); return; }
+  if (game.state === 'powerSelect')  { drawPowerSelect(game.time);  ctx.restore(); return; }
+  if (!game.level) { ctx.restore(); return; }
+  drawBackground(game.level.theme, game.time);
+  ctx.save();
+  ctx.translate(-Math.floor(game.camera.x), -Math.floor(game.camera.y));
+  drawTiles(game.level, game.time);
+  for (const k of game.pickups) drawPickup(k, game.time);
+  for (const e of game.enemies) {
+    drawEnemy(e, game.time);
+    if (e.alive && e.chatter && e.chatter.life > 0) drawChatter(e);
+  }
+  if (game.player) drawFrida(game.player, game.time);
+  // Projectiles
+  if (game.projectiles && game.projectiles.length) {
+    for (const pr of game.projectiles) {
+      ctx.save();
+      ctx.translate(pr.x, pr.y);
+      const grad = ctx.createRadialGradient(0, 0, 2, 0, 0, 14);
+      grad.addColorStop(0, 'rgba(255, 200, 80, 0.8)');
+      grad.addColorStop(1, 'rgba(255, 100, 30, 0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(-14, -14, 28, 28);
+      ctx.fillStyle = '#ff6622';
+      ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#ffcc44';
+      ctx.beginPath(); ctx.arc(-1, -1, 2.5, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+  }
+  drawParticles();
+  drawFloatTexts();
+  ctx.restore();
+  if (game.flashRed > 0) {
+    ctx.fillStyle = `rgba(255, 30, 30, ${game.flashRed/40})`;
+    ctx.fillRect(0,0,W,H);
+  }
+  if (game.flashGold > 0) {
+    ctx.fillStyle = `rgba(255, 220, 80, ${game.flashGold/60})`;
+    ctx.fillRect(0,0,W,H);
+  }
+  drawHUD();
+  drawNotifications();
+  if (game.state === 'paused') drawPause();
+  ctx.restore();
+}
+
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+loop();
+
+</script>
+</body>
+</html>
+ (game.state === 'paused') drawPause();
+  ctx.restore();
+}
+
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+loop();
+
+</script>
+</body>
+</html>
+x += pr.vx;
+      pr.y += pr.vy;
+      pr.vy += 0.15;
+      pr.life--;
+      for (const e of game.enemies) {
+        if (!e.alive) continue;
+        if (pr.x > e.x && pr.x < e.x + e.w && pr.y > e.y && pr.y < e.y + e.h) {
+          if (e.isBoss) {
+            e.hp--;
+            if (e.hp <= 0) {
+              e.alive = false; game.bossKilled = true;
+              game.score += 1000; SFX.win();
+              spawnPetals(e.x+e.w/2, e.y+e.h/2);
+              pushNotif({ iconKind:'fire', title:'BOSS BRÛLÉ', desc:'Tu as réduit la Reine en cendres !', color:'#ff6622' });
+            } else spawnPuff(e.x+e.w/2, e.y, '#ffaa44');
+          } else {
+            e.alive = false;
+            game.score += 100; SFX.stomp();
+            spawnPuff(e.x+e.w/2, e.y+e.h/2, '#ffaa44');
+          }
+          pr.life = 0; break;
+        }
+      }
+      const tx = Math.floor(pr.x / TILE);
+      const ty = Math.floor(pr.y / TILE);
+      if (ty >= 0 && ty < game.level.h && tx >= 0 && tx < game.level.w) {
+        const c = game.level.grid[ty][tx];
+        if (SOLIDS.has(c)) pr.life = 0;
+      }
+      if (pr.life <= 0) game.projectiles.splice(i, 1);
+    }
+  }
+  updateParticles();
+  updateFloatTexts();
+  updateNotifications();
+  game.enemies = game.enemies.filter(e => e.alive || e.deathTimer < 40);
+  updateCamera();
+  if (game.shake > 0) game.shake--;
+  if (game.flashRed > 0) game.flashRed--;
+  if (game.flashGold > 0) game.flashGold--;
+  const anyDecor = game.decorTriggered.lantern || game.decorTriggered.gear || game.decorTriggered.rose || game.decorTriggered.brush;
+  if (anyDecor && game.decorTransition < 60) game.decorTransition++;
+  if (game.messageTimer > 0) game.messageTimer--;
+}
+
+function render() {
+  ctx.save();
+  if (game.state === 'playing' && game.shake > 0) {
+    ctx.translate((Math.random()-0.5)*game.shake, (Math.random()-0.5)*game.shake);
+  }
+  if (game.state === 'title')        { drawTitle(game.time);        ctx.restore(); return; }
+  if (game.state === 'win')          { drawWinScreen(game.time);    ctx.restore(); return; }
+  if (game.state === 'gameover')     { drawGameOver(game.time);     ctx.restore(); return; }
+  if (game.state === 'intermission') { drawIntermission(game.time); ctx.restore(); return; }
+  if (game.state === 'fridaQA')      { drawFridaQA(game.time);      ctx.restore(); return; }
+  if (game.state === 'powerSelect')  { drawPowerSelect(game.time);  ctx.restore(); return; }
+  if (!game.level) { ctx.restore(); return; }
+  drawBackground(game.level.theme, game.time);
+  ctx.save();
+  ctx.translate(-Math.floor(game.camera.x), -Math.floor(game.camera.y));
+  drawTiles(game.level, game.time);
+  for (const k of game.pickups) drawPickup(k, game.time);
+  for (const e of game.enemies) {
+    drawEnemy(e, game.time);
+    if (e.alive && e.chatter && e.chatter.life > 0) drawChatter(e);
+  }
+  if (game.player) drawFrida(game.player, game.time);
+  if (game.projectiles && game.projectiles.length) {
+    for (const pr of game.projectiles) {
+      ctx.save();
+      ctx.translate(pr.x, pr.y);
+      const grad = ctx.createRadialGradient(0, 0, 2, 0, 0, 14);
+      grad.addColorStop(0, 'rgba(255, 200, 80, 0.8)');
+      grad.addColorStop(1, 'rgba(255, 100, 30, 0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(-14, -14, 28, 28);
+      ctx.fillStyle = '#ff6622';
+      ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+  }
+  drawParticles();
+  drawFloatTexts();
+  ctx.restore();
+  if (game.flashRed > 0) { ctx.fillStyle = `rgba(255, 30, 30, ${game.flashRed/40})`; ctx.fillRect(0,0,W,H); }
+  if (game.flashGold > 0) { ctx.fillStyle = `rgba(255, 220, 80, ${game.flashGold/60})`; ctx.fillRect(0,0,W,H); }
+  drawHUD();
+  drawNotifications();
+  if (game.state === 'paused') drawPause();
+  ctx.restore();
+}
+
+function loop() { update(); render(); requestAnimationFrame(loop); }
+loop();
+
+</script>
+</body>
+</html>
